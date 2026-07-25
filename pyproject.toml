@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opteryx-flight"
+version = "0.0.1"
+description = "Opteryx Arrow Flight SQL Service"
+requires-python = '>=3.14'
+dependencies = [
+    "cryptography==46.0.5",
+    "google-cloud-firestore==2.25.0",
+    "google-cloud-secret-manager==2.26.0",
+    "google-cloud-storage==3.9.0",
+    "opteryx-catalog>=0.4.56",
+    "opteryx-core>=0.9.31,<0.10",
+    "protobuf>=6.31.1,<7",
+    "pyarrow==25.0.0",
+    "python-dateutil==2.9.0.post0",
+    "python-jose[cryptography]==3.5.0",
+    "requests==2.32.5",
+]
+
+[tool.isort]
+profile = "black"
+extend_skip_glob = ["tests/**"]
+skip_gitignore = true
+line_length = 100
+multi_line_output = 9
+force_single_line = true
+float_to_top = true
+ensure_newline_before_comments = true
+
+[tool.ruff]
+line-length = 100
+indent-width = 4
+target-version = 'py313'
+exclude = ["tests/"]
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 100

@@ -1,0 +1,11 @@
+options:
+  env:
+    - 'AR_REGION=us-east1'
+    - 'AR_REPOSITORY=cloud-run-source-deploy'
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [ 'build', '-t', 'us-east1-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/flight-opteryx:$SHORT_SHA', '.' ]
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [ 'push', 'us-east1-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/flight-opteryx:$SHORT_SHA' ]
+images:
+  - 'us-east1-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/flight-opteryx:$SHORT_SHA'
