@@ -8,13 +8,19 @@ call carries gRPC metadata, surfaced to a `ServerMiddleware` via
 Every command handler fetches claims via
 `context.get_middleware("auth").claims` instead of a FastAPI dependency.
 Registered on the server as `middleware={"auth": ClaimsMiddlewareFactory()}`.
+
+Unlike odata.opteryx (and unlike this service's own earlier v1 draft), a
+call with no `authorization` metadata at all is NOT let through as
+anonymous — `require_bearer_token` already rejects a missing/empty value
+with `AuthError(401, "Missing bearer token")`, so calling it directly here
+is sufficient to require a valid credential on every single Flight call.
 """
 
 from __future__ import annotations
 
 import pyarrow.flight as fl
 
-from app.auth.deps import require_flight_authentication
+from app.auth.deps import require_bearer_token
 from app.auth.errors import AuthError
 
 # AuthError.status_code -> the FlightError subclass that best represents it.
@@ -46,7 +52,7 @@ class ClaimsMiddlewareFactory(fl.ServerMiddlewareFactory):
         auth_values = headers.get("authorization", [])
         authorization = auth_values[0] if auth_values else None
         try:
-            claims = require_flight_authentication(authorization)
+            claims = require_bearer_token(authorization)
         except AuthError as exc:
             raise _flight_error_for(exc) from exc
         return ClaimsMiddleware(claims)

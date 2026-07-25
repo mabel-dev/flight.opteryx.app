@@ -5,17 +5,15 @@ Ported from odata.opteryx's `app/auth/deps.py`. The JWT verification logic
 unchanged apart from swapping `HTTPException`/`Header` for the
 transport-agnostic `AuthError` and a plain `Optional[str]` parameter.
 
-`require_authentication` doesn't carry over as-is: it takes a FastAPI
-`Request` (to stash `request.state.claims`) and supports a Basic-auth
-fallback. Flight has no per-request `Request` object and, per the design,
-v1 has no Basic-auth fallback (Flight SQL JDBC/ODBC drivers authenticate via
-bearer token, not HTTP Basic). `require_flight_authentication` below keeps
-the one behavior from `require_authentication` that matters here: a call
-with no `Authorization` header at all is let through as anonymous rather
-than rejected, so per-handler code can decide whether to tolerate anonymous
-callers (mirrors `require_authentication`'s docstring). A call that DOES
-send a value that isn't a bearer token is rejected — same "anonymous means
-omitted entirely, not malformed" rule odata.opteryx applies.
+`require_authentication` doesn't carry over: it takes a FastAPI `Request`
+(to stash `request.state.claims`), supports a Basic-auth fallback (v1 has
+none here — Flight SQL JDBC/ODBC drivers authenticate via bearer token, not
+HTTP Basic), and — unlike this service — lets a call with no `Authorization`
+header through as anonymous. flight.opteryx deliberately does not offer that:
+every call must carry a valid bearer token, full stop. `app.flight.auth_middleware`
+calls `require_bearer_token` directly for this reason; there is no
+Flight-specific wrapper here to carry that anonymous-tolerant behavior,
+because there isn't any.
 """
 
 import os
@@ -222,22 +220,3 @@ def require_bearer_token(authorization: Optional[str]) -> Dict[str, Any]:
         return _normalize_claims(google_claims)
 
     raise AuthError(401, "Invalid token")
-
-
-def require_flight_authentication(authorization: Optional[str]) -> Dict[str, Any]:
-    """Resolve claims for one Flight call, tolerating anonymous callers.
-
-    A call with no `Authorization` metadata at all is let through as
-    anonymous (`{"identity": None, "policies": [], "billing_account": None}`)
-    — same as odata.opteryx's `require_authentication` — so command handlers
-    can decide for themselves whether to accept anonymous callers. A call
-    that sends a non-bearer (or malformed bearer) value is rejected: only
-    omitting auth entirely counts as anonymous.
-    """
-    if not authorization:
-        return {"identity": None, "policies": [], "billing_account": None}
-
-    if not authorization.lower().startswith("bearer "):
-        raise AuthError(401, "Missing or invalid credentials")
-
-    return require_bearer_token(authorization)

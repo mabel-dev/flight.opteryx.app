@@ -79,10 +79,22 @@ PORT=8815 uv run python -m app.main
 # or: PORT=8815 .venv/bin/python -m app.main
 ```
 
-By default this runs with no auth configured (anonymous claims) and no
-Firestore/GCS access — `CommandStatementQuery` against built-in sample data
-(e.g. `$planets`) works out of the box; catalog/table listing and
-credentialed queries need the environment variables below.
+Every call requires a valid bearer token — unlike `odata.opteryx`, there is
+no anonymous access here (see [docs/design.md](docs/design.md), "Auth
+design"). Get one the same way you would for any other opteryx.app service,
+via the `client_credentials` grant:
+
+```bash
+curl -X POST https://authenticate.opteryx.app/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=client_credentials' \
+  -d 'client_id=YOUR_CLIENT_ID' \
+  -d 'client_secret=YOUR_CLIENT_SECRET'
+```
+
+Set `FLIGHT_TOKEN` to the resulting `access_token` — [examples/query.py](examples/query.py)
+picks it up automatically. Catalog/table listing additionally needs the
+Firestore/GCS environment variables below regardless of auth.
 
 ## Example client
 
@@ -91,18 +103,16 @@ demonstrates the `GetFlightInfo` → `DoGet` round trip directly against a
 running server:
 
 ```bash
-python examples/query.py "SELECT * FROM \$planets LIMIT 5"
+python examples/query.py "SELECT * FROM \$planets LIMIT 5" --token "$FLIGHT_TOKEN"
 
-python examples/query.py "SELECT 1" --url grpc+tls://flight.opteryx.app:443
-
-python examples/query.py "SELECT * FROM some.workspace.table" --token "$FLIGHT_TOKEN"
+python examples/query.py "SELECT 1" --url grpc+tls://flight.opteryx.app:443 --token "$FLIGHT_TOKEN"
 ```
 
 `--url` defaults to `$FLIGHT_SERVER_URL` (falling back to the production
 service, `grpc+tls://flight.opteryx.app:443`); `--token` defaults to
-`$FLIGHT_TOKEN` and is a bearer JWT — omit it for anonymous access (allowed
-at the transport layer, but most relations reject anonymous callers at the
-permissions layer; see [docs/design.md](docs/design.md), "Auth design").
+`$FLIGHT_TOKEN` and is required — every call needs a valid bearer token (see
+"Local development" above for how to get one), there is no anonymous
+fallback.
 
 This is *not* how a real BI tool connects — those use the upstream Flight SQL
 JDBC driver or ADBC ODBC driver, which speak this same wire protocol under

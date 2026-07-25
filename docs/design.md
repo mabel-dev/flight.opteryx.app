@@ -168,11 +168,21 @@ class ClaimsMiddlewareFactory(fl.ServerMiddlewareFactory):
 registered on the server as `middleware={"auth": ClaimsMiddlewareFactory()}`.
 Every command handler fetches claims via
 `context.get_middleware("auth").claims` instead of a FastAPI dependency.
-Same as `odata.opteryx`, an anonymous (no-`Authorization`) call is not
-rejected at this layer — `require_bearer_token` already returns a
-best-effort anonymous claims shape; whether a given command tolerates
-anonymous callers is decided per-handler, same division of responsibility as
-`odata.opteryx`'s `require_authentication` docstring describes.
+
+**Unlike `odata.opteryx`, there is no anonymous access.** `odata.opteryx`
+lets a request with no `Authorization` header through with a best-effort
+anonymous claims shape, and leaves it to each route to decide whether it
+tolerates that (`is_anonymous_exempt`, scoped to two specific public
+datasets). Flight SQL's command surface has no equivalent per-route hook —
+`CommandStatementQuery` carries an arbitrary SQL string that can name any
+table or none at all, so there is no single (workstream, collection) pair to
+gate an anonymous-tolerance decision on before the query runs. Rather than
+build one, v1 requires a valid bearer token on every call: `start_call`
+above passes `authorization` straight to `require_bearer_token`, which
+already rejects a missing or malformed value with `AuthError(401, ...)`.
+This was in fact the original shape of this snippet; an earlier draft added
+an anonymous-tolerant wrapper on top of it, which has since been removed
+along with the wrapper.
 
 Unlike the OData service, there is no Basic-auth fallback in v1 — Flight SQL
 JDBC/ODBC drivers authenticate via bearer token or Flight's handshake

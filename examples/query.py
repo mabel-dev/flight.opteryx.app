@@ -14,16 +14,16 @@ protocol concrete, and as a smoke test you can run against a live
 deployment.
 
 Usage:
-    python examples/query.py "SELECT * FROM \\$planets LIMIT 5"
-    python examples/query.py "SELECT 1" --url grpc+tls://flight.opteryx.app:443
-    python examples/query.py "SELECT * FROM public.security.some_table" --token "$FLIGHT_TOKEN"
+    python examples/query.py "SELECT * FROM \\$planets LIMIT 5" --token "$FLIGHT_TOKEN"
+    python examples/query.py "SELECT 1" --url grpc+tls://flight.opteryx.app:443 --token "$FLIGHT_TOKEN"
+
+A token is required -- unlike odata.opteryx, this service has no anonymous
+access (see docs/design.md, "Auth design"). Get one via the client_credentials
+grant (see README.md, "Local development") and set it as FLIGHT_TOKEN.
 
 Environment variables (used when the matching flag is omitted):
     FLIGHT_SERVER_URL   Same as --url. Defaults to grpc+tls://flight.opteryx.app:443.
-    FLIGHT_TOKEN        Same as --token. A bearer JWT; omit for anonymous access
-                         (see docs/design.md, "Auth design" -- anonymous callers
-                         are not rejected at the transport layer, but most
-                         relations will reject them at the permissions layer).
+    FLIGHT_TOKEN        Same as --token. A bearer JWT; required.
 """
 
 from __future__ import annotations
@@ -77,9 +77,17 @@ def main() -> None:
     parser.add_argument(
         "--token",
         default=os.environ.get("FLIGHT_TOKEN"),
-        help="Bearer JWT for authenticated access (omit for anonymous)",
+        help="Bearer JWT (required -- no anonymous access; see README.md)",
     )
     args = parser.parse_args()
+
+    if not args.token:
+        print(
+            "Error: --token (or $FLIGHT_TOKEN) is required -- this service has no "
+            "anonymous access. See README.md, \"Local development\", for how to get one.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     try:
         table = run_query(args.url, args.sql, args.token)
