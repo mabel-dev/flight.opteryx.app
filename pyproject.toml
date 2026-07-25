@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Opteryx Arrow Flight SQL Service"
 requires-python = '>=3.14'
 dependencies = [
-    "cryptography==46.0.5",
+    "cryptography==48.0.1",
     "google-cloud-firestore==2.25.0",
     "google-cloud-secret-manager==2.26.0",
     "google-cloud-storage==3.9.0",
