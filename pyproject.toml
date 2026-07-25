@@ -13,7 +13,7 @@ dependencies = [
     "google-cloud-secret-manager==2.26.0",
     "google-cloud-storage==3.9.0",
     "opteryx-catalog>=0.4.56",
-    "opteryx-core>=0.9.31,<0.10",
+    "opteryx-core>=0.9.41,<0.10",
     "protobuf>=6.31.1,<7",
     "pyarrow==25.0.0",
     "python-dateutil==2.9.0.post0",
