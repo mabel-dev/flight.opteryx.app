@@ -84,9 +84,28 @@ def session_for_claims(claims: Dict[str, Any]) -> "opteryx.query_session.Session
     `execute_odata_query` (identity/access_policies/billing_account from claims),
     so Opteryx's own permission checks run against the actual caller rather than
     an empty (deny-all) context.
+
+    `access_policies` is passed through EXACTLY as `access_policies_for_query`
+    returns it -- including an empty list -- and must never be coerced to
+    `None`. `opteryx.query_session.Session.__init__` checks `access_policies
+    is None` (not falsiness) to decide whether to apply its own default of
+    `[{"pattern": "*", "role": "owner"}]` (i.e. "no policies argument was
+    given, so grant everything"). `[] or None` collapses "this caller was
+    granted zero policies" into that same "not given" sentinel, silently
+    handing every zero-policy caller -- anonymous callers above all --
+    owner-level access to every relation in Opteryx. Confirmed against the
+    live installed opteryx-core: `access_policies=[] or None` (i.e. `None`)
+    resolves to `[{'pattern': '*', 'role': 'owner'}]`; `access_policies=[]`
+    resolves to `[]`. odata.opteryx's `interface.py` has this same `or None`
+    pattern, masked there only because every route checks
+    `is_anonymous_exempt(workstream, collection)` before ever constructing a
+    session -- Flight SQL's arbitrary-`CommandStatementQuery` surface has no
+    single (workstream, collection) pair to gate on, so there is no
+    equivalent guard upstream of this call; passing the real (possibly
+    empty) list through is the only correct fix here.
     """
     identity = claims.get("identity")
-    access_policies = access_policies_for_query(claims) or None
+    access_policies = access_policies_for_query(claims)
     billing_account = claims.get("billing_account")
     return opteryx.session(
         user=identity,
