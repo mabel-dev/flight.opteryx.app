@@ -83,8 +83,13 @@ def _normalize_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
     if identity:
         claims["identity"] = identity
 
-    # Who pays for this caller's usage. Not the same as identity.
-    claims["billing_account"] = billing_account_from_claims(claims)
+    # Who pays for this caller's usage. Not the same as identity. Falls back to the
+    # caller's own `sub` when the token carries no scope: an unscoped individual bills
+    # to themselves, not to the house account.
+    billing_account = billing_account_from_claims(claims)
+    if billing_account is None:
+        billing_account = claims.get("sub")
+    claims["billing_account"] = billing_account
 
     # "policies" claim may be present in tokens and encodes what a user can access.
     # We will NOT write or rely on a separate "permissions" claim (that was incorrect).
