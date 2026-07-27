@@ -47,10 +47,9 @@ def entitlements_from_claims(claims: Dict[str, Any]) -> set:
     "data_admin"]`) but the issuer flattens them into a single comma-delimited
     `entitlement` claim. Both shapes are accepted, as is the plural key.
 
-    Splitting on the delimiter is safe here, unlike for `scope` — entitlements are
-    multi-valued by definition, so a delimiter is unambiguous. `scope` carries exactly
-    one value (the billing account), which is why billing_account_from_claims refuses
-    to split rather than guessing which half to bill.
+    Splitting on the delimiter is safe here: entitlements are multi-valued by
+    definition, so a delimiter is unambiguous. The billing account is not — it has its
+    own single-valued claim and is never parsed out of a delimited string.
     """
     raw = claims.get("entitlement") or claims.get("entitlements") or ()
 
@@ -69,45 +68,41 @@ def entitlements_from_claims(claims: Dict[str, Any]) -> set:
 
 
 def billing_account_from_claims(claims: Dict[str, Any]) -> Optional[str]:
-    """Extract the caller's billing account from the JWT "scope" claim.
+    """Extract the caller's billing account from the JWT `billing_account` claim.
 
-    The issuer puts the billing account in `scope` as a single value. It is
-    deliberately NOT derived from `sub`/`identity`: many users bill to one
-    account, so identity and billing account are different things.
+    This used to read `scope`. It must not: `scope` is an OAuth permission list,
+    written by register.opteryx as comma-separated permission words, and reading it
+    as a tenant identity billed every self-service user to whatever value happened to
+    be sitting there — in practice the literal "opteryx", which is simultaneously the
+    house account and the name of the system workspace, so billing rows read as though
+    the workspace were the payer. The issuer now emits the account as its own claim.
 
-    Multi-valued scopes are refused rather than guessed at. OAuth allows `scope`
-    to carry several space-delimited values, and the two (dead) extractors in
-    billing.opteryx disagree about whether the delimiter is a space or a comma.
-    Picking one would risk attributing usage to the wrong tenant — i.e. billing
-    the wrong customer. Returning None instead sends the usage to the house
-    account, which is wrong but not someone else's bill.
+    A single value by definition: a caller bills to one account or to none. There is
+    nothing to split and nothing to disambiguate, which is the point of the separate
+    claim — the old multi-valued `scope` was silently unbillable.
+
+    Falls back to `sub` when the claim is absent: a caller with no explicit account
+    bills to themselves rather than to the house account. Note this puts identities
+    and tenant account names in one namespace — a `sub` equal to a tenant's account
+    name would inherit that tenant's billing rows through the Eq visibility filter.
 
     Returns:
-        The billing account, or None if absent/empty/ambiguous.
+        The billing account, or None if the token carries neither claim.
     """
-    scope = claims.get("scope")
+    billing_account = claims.get("billing_account")
+    if billing_account is None:
+        billing_account = claims.get("sub")
 
-    # Some issuers emit scope as a list rather than a delimited string.
-    if isinstance(scope, (list, tuple)):
-        values = [str(s).strip() for s in scope if str(s).strip()]
-    elif isinstance(scope, str):
-        values = [s for s in scope.replace(",", " ").split() if s]
-    elif scope is None:
+    if billing_account is None:
         return None
-    else:
-        logger.warning(f"Ignoring 'scope' claim of unexpected type {type(scope).__name__}")
-        return None
-
-    if not values:
-        return None
-    if len(values) > 1:
+    if not isinstance(billing_account, str):
         logger.warning(
-            f"Ignoring multi-valued 'scope' claim ({len(values)} values); cannot determine "
-            "billing account unambiguously, usage will fall back to the default account"
+            f"Ignoring billing account of unexpected type {type(billing_account).__name__}"
         )
         return None
 
-    return values[0]
+    billing_account = billing_account.strip()
+    return billing_account or None
 
 
 # The base table holding billing events. Row-level filters MUST be keyed on this and

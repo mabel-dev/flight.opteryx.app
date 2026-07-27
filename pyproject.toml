@@ -2,6 +2,9 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+include = ["app*"]
+
 [project]
 name = "opteryx-flight"
 version = "0.0.1"
@@ -14,9 +17,9 @@ dependencies = [
     "google-cloud-storage==3.13.0",
     "opteryx-catalog>=0.4.57",
     "opteryx-core>=0.9.42,<0.10",
-    "protobuf>=7.35.1,<7",
+    "protobuf>=7.35.1,<8",
     "pyarrow==25.0.0",
-    "python-dateutil==2.9.0.post0post0",
+    "python-dateutil==2.9.0.post0",
     "python-jose[cryptography]==3.5.0",
     "requests==2.34.2",
 ]

@@ -115,14 +115,9 @@ def authenticate_with_external_service(username: str, password: str) -> Dict[str
 
         # This path does not go through _normalize_claims, so derive the billing
         # account here too — otherwise basic-auth callers bill to the house account.
-        # Falls back to the caller's own `sub` when the token carries no scope: an
-        # unscoped individual bills to themselves, not to the house account.
         from app.auth.permissions import billing_account_from_claims
 
-        billing_account = billing_account_from_claims(claims)
-        if billing_account is None:
-            billing_account = claims.get("sub")
-        claims["billing_account"] = billing_account
+        claims["billing_account"] = billing_account_from_claims(claims)
 
         logger.info(
             f"Successfully authenticated user '{username}' (identity: {identity}) with {len(policies)} policies"
