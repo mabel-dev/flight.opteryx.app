@@ -1,13 +1,17 @@
 # Vendored from opteryx-config-client -- do not edit here.
 # Re-sync with: opteryx-config-client/vendor.sh <this-repo>
-"""Client for the Opteryx platform configuration service (config.opteryx.app).
+"""Client for Opteryx platform configuration.
+
+Configuration lives in Firestore at ``(default)/config/<environment>``, one
+document per environment (in practice the GCP project the service runs in).
+This client reads that document directly.
 
 Resolution hierarchy for every lookup:
 
 1. The process's own environment variables — a value set in the service's
    ENVVARs always wins, so per-service overrides keep working.
-2. The remote configuration document for this environment, cached for at
-   most 60 seconds.
+2. The configuration document for this environment, read at boot and cached
+   for at most 5 minutes.
 3. The ``default`` supplied by the caller.
 
 Usage::
@@ -16,55 +20,57 @@ Usage::
 
     AUTH_URL = get_config("AUTH_URL", default="https://authenticate.opteryx.app")
 
-Authentication is Google OIDC. config.opteryx.app is deployed IAM-private and
-each calling service's service account holds ``roles/run.invoker``; this client
-mints an identity token from the GCP metadata server (or from Application
-Default Credentials when running outside Cloud Run). There is no secret to
-store, distribute, or rotate.
+Access is Firestore IAM: the service account needs read on the ``(default)``
+database (``roles/datastore.viewer``). There is no token to mint, no audience
+to agree on, and no intermediate service to be unavailable — the read is one
+gRPC call on a client the service is already holding open.
+
+The document is read once at import, so the first lookup does not pay for it.
+Set ``OPTERYX_CONFIG_EAGER=false`` to skip that and fetch lazily instead.
 
 Environment:
 
-- ``OPTERYX_ENVIRONMENT`` — the environment (GCP project) name. Falls back to
-  ``GCP_PROJECT_ID`` / ``GCP_PROJECT`` / ``GOOGLE_CLOUD_PROJECT``.
-- ``CONFIG_URL`` — config service URL (default ``https://config.opteryx.app``).
-- ``CONFIG_AUDIENCE`` — OIDC audience (defaults to ``CONFIG_URL``).
-- ``OPTERYX_SERVICE`` — this service's name, reported to the config service as
-  a ``?service=`` query parameter so its logs can attribute traffic. Falls back
-  to ``K_SERVICE`` / ``CLOUD_RUN_JOB``, both set automatically by Cloud Run.
-- ``OPTERYX_SERVICE_TOKEN`` — an explicit token that bypasses OIDC minting.
-  Intended for local development and tests only.
+- ``OPTERYX_ENVIRONMENT`` — the environment (GCP project) name, which is the
+  document id. Falls back to ``GCP_PROJECT_ID`` / ``GCP_PROJECT`` /
+  ``GOOGLE_CLOUD_PROJECT``, then to the GCP metadata server.
+- ``CONFIG_PROJECT`` — the GCP project whose Firestore holds the configuration
+  document. Defaults to the service's own project, which is correct whenever
+  the service reads the configuration for the project it runs in.
+- ``OPTERYX_CONFIG_EAGER`` — set to ``false`` to skip the read at import.
 
-The client is deliberately fail-open: if the config service is unreachable it
-serves the last-known values (even if stale) and otherwise the caller's
-default, so a config-service outage cannot take down the fleet.
+The client is deliberately fail-open: if Firestore is unreachable it serves the
+last-known values (even if stale) and otherwise the caller's default, so a
+Firestore blip cannot take down the fleet.
 """
 
-import base64
-import binascii
-import json
 import logging
 import os
-import re
 import threading
 import time
+import urllib.request
 from typing import Any, Callable, Dict, Optional
 
-import requests
+CACHE_TTL_SECONDS = 300.0
 
-CACHE_TTL_SECONDS = 60.0
-_REQUEST_TIMEOUT_SECONDS = 10.0  # generous, to allow for Cloud Run cold starts
-_TOKEN_REFRESH_MARGIN_SECONDS = 300.0  # refresh 5 minutes before expiry
+# Bounds the read itself. The document is read at import, so an unbounded call
+# against an unreachable Firestore would hang container startup rather than
+# fail open.
+READ_TIMEOUT_SECONDS = 10.0
+
+COLLECTION = "config"
+DATABASE = "(default)"
 
 _UNSET = object()
 
 ENV = "env"          # value came from the process's own environment
-CONFIG = "config"    # value came from the remote configuration document
+CONFIG = "config"    # value came from the configuration document
 DEFAULT = "default"  # value came from the caller's fallback
 
 logger = logging.getLogger("opteryx.config_client")
 
 
 _METADATA_URL = "http://metadata.google.internal/computeMetadata/v1/project/project-id"
+_METADATA_TIMEOUT_SECONDS = 0.5
 _METADATA_PROJECT: Any = _UNSET  # cached; the project never changes for a process
 
 
@@ -75,6 +81,12 @@ def _metadata_project() -> Optional[str]:
     to identify its own environment. Mirrors the approach the services already
     use in their `secret_store` modules. The result is cached, including
     failures, so a non-GCP host pays the timeout at most once.
+
+    Deliberately not `google.auth.default()`: that probes the metadata server
+    with a 3-second timeout and three retries, so a host with neither metadata
+    nor Application Default Credentials -- CI, a fresh laptop -- blocks for
+    around nine seconds. Since the document is read at import, that would be
+    nine seconds of startup hang in every service that vendors this module.
     """
     global _METADATA_PROJECT
     if _METADATA_PROJECT is not _UNSET:
@@ -82,12 +94,17 @@ def _metadata_project() -> Optional[str]:
 
     project = None
     try:
-        response = requests.get(
-            _METADATA_URL, headers={"Metadata-Flavor": "Google"}, timeout=0.5
+        request = urllib.request.Request(
+            _METADATA_URL, headers={"Metadata-Flavor": "Google"}
         )
-        if response.status_code == 200:
-            project = response.text.strip() or None
-    except requests.RequestException:
+        # Bypass any configured proxy: the metadata server is link-local, and a
+        # proxy that swallows the request turns a fast miss into a slow one.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=_METADATA_TIMEOUT_SECONDS) as response:
+            if response.status == 200:
+                project = response.read().decode("utf-8").strip() or None
+    except Exception:
+        # Not on GCP, or the metadata server is unreachable.
         project = None
 
     _METADATA_PROJECT = project
@@ -104,86 +121,24 @@ def _detect_environment() -> Optional[str]:
     )
 
 
-_SERVICE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
-
-
-def _detect_service() -> Optional[str]:
-    """Name the calling service, for the config service's request log.
-
-    Cloud Run sets ``K_SERVICE`` on services and ``CLOUD_RUN_JOB`` on jobs;
-    neither exists outside Cloud Run, so this is None in local development and
-    the parameter is simply omitted.
-
-    The name is self-declared and unverifiable -- it is for attributing traffic
-    only, never for authorization. The config service authorizes on the OIDC
-    identity, which is the claim it can actually check.
-    """
-    name = (
-        os.environ.get("OPTERYX_SERVICE")
-        or os.environ.get("K_SERVICE")
-        or os.environ.get("CLOUD_RUN_JOB")
-        or ""
-    ).strip()
-    # Cloud Run's own service and job names always satisfy this; a hand-set
-    # OPTERYX_SERVICE might not, and a junk value is worse than no value.
-    return name if _SERVICE_NAME_PATTERN.match(name) else None
-
-
-def _token_expiry(token: str) -> Optional[float]:
-    """Read ``exp`` from a JWT without verifying it.
-
-    The token is one we just minted for ourselves, so this is only used to
-    decide when to refresh -- never as a trust decision.
-    """
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
-    except (IndexError, KeyError, ValueError, TypeError, binascii.Error):
-        return None
-
-
-def _rejection_reason(response: "requests.Response") -> str:
-    """Say who rejected the request and why, from the response body.
-
-    A 401 or 403 can come from two very different places, needing different
-    fixes: Cloud Run's IAM layer rejecting before the container is reached, or
-    the config service's own identity verification. Cloud Run returns an HTML
-    error page; the service returns JSON `{"detail": ...}`. Distinguishing them
-    is the difference between fixing an IAM grant and fixing an audience.
-    """
-    try:
-        payload = response.json()
-    except ValueError:
-        return "rejected before reaching the service (no JSON body)"
-    if isinstance(payload, dict) and payload.get("detail"):
-        return f"service said {str(payload['detail'])[:120]!r}"
-    return "no detail in response"
-
-
 class ConfigClient:
-    """Fetches and caches an environment's configuration document."""
+    """Reads and caches an environment's configuration document from Firestore."""
 
     def __init__(
         self,
         environment: Optional[str] = None,
-        config_url: Optional[str] = None,
-        audience: Optional[str] = None,
-        token_provider: Optional[Callable[[], Optional[str]]] = None,
+        project: Optional[str] = None,
         cache_ttl: float = CACHE_TTL_SECONDS,
-        service: Optional[str] = None,
+        client_provider: Optional[Callable[[], Any]] = None,
     ):
         self._environment = environment
-        self._config_url = config_url
-        self._audience = audience
-        self._service = service
-        self._token_provider = token_provider
+        self._project = project
         self._cache_ttl = cache_ttl
+        self._client_provider = client_provider
         self._lock = threading.Lock()
+        self._firestore: Any = None
         self._values: Dict[str, Any] = {}
         self._fetched_at: float = 0.0
-        self._token: Optional[str] = None
-        self._token_expires_at: float = 0.0
         self._sources: Dict[str, str] = {}
         self._last_fetch_ok: Optional[bool] = None
         self._last_fetch_detail: str = "no fetch attempted"
@@ -193,56 +148,38 @@ class ConfigClient:
         return self._environment or _detect_environment()
 
     @property
-    def config_url(self) -> str:
-        configured = self._config_url or os.environ.get("CONFIG_URL", "https://config.opteryx.app")
-        return configured.rstrip("/")
+    def project(self) -> Optional[str]:
+        return self._project or os.environ.get("CONFIG_PROJECT") or _metadata_project()
 
-    @property
-    def audience(self) -> str:
-        return self._audience or os.environ.get("CONFIG_AUDIENCE") or self.config_url
+    def set_client_provider(self, provider: Callable[[], Any]) -> None:
+        """Supply the Firestore client to read with.
 
-    @property
-    def service(self) -> Optional[str]:
-        return self._service or _detect_service()
+        A service that already holds a ``(default)``-database client can hand it
+        over rather than have this module open a second gRPC channel. The
+        provider is called once and the result cached.
+        """
+        with self._lock:
+            self._client_provider = provider
+            self._firestore = None
 
-    def set_token_provider(self, provider: Callable[[], Optional[str]]) -> None:
-        """Override how tokens are obtained. Rarely needed; OIDC is automatic."""
-        self._token_provider = provider
+    def _client(self) -> Any:
+        """Return the Firestore client, creating and caching one if needed."""
+        if self._firestore is not None:
+            return self._firestore
 
-    def _mint_identity_token(self) -> Optional[str]:
-        """Mint a Google OIDC identity token for the config service."""
-        try:
-            import google.auth.transport.requests  # type: ignore
-            from google.oauth2 import id_token  # type: ignore
+        if self._client_provider is not None:
+            self._firestore = self._client_provider()
+            return self._firestore
 
-            return id_token.fetch_id_token(
-                google.auth.transport.requests.Request(), self.audience
-            )
-        except Exception:
-            # No metadata server and no usable ADC -- e.g. local development.
-            return None
+        from google.cloud import firestore  # type: ignore
 
-    def _current_token(self) -> Optional[str]:
-        if self._token_provider is not None:
-            return self._token_provider()
-
-        override = os.environ.get("OPTERYX_SERVICE_TOKEN")
-        if override:
-            return override
-
-        now = time.time()
-        if self._token and now < self._token_expires_at:
-            return self._token
-
-        token = self._mint_identity_token()
-        if token:
-            expiry = _token_expiry(token)
-            # Without a readable exp, re-mint on every fetch rather than guess.
-            self._token_expires_at = (
-                expiry - _TOKEN_REFRESH_MARGIN_SECONDS if expiry else 0.0
-            )
-            self._token = token
-        return token
+        project = self.project
+        self._firestore = (
+            firestore.Client(project=project, database=DATABASE)
+            if project
+            else firestore.Client(database=DATABASE)
+        )
+        return self._firestore
 
     def _fetch(self) -> None:
         """Refresh the cached document; on failure keep serving the last-known values."""
@@ -253,58 +190,37 @@ class ConfigClient:
             self._fetched_at = time.monotonic()
             return
 
-        token = self._current_token()
-        if not token:
-            # Not running with credentials; env vars and defaults still work.
-            self._last_fetch_ok = False
-            self._last_fetch_detail = "no identity token could be obtained"
-            self._fetched_at = time.monotonic()
-            return
-
-        # Names this service in the config service's request log. That log is
-        # written by Cloud Run itself, so it records the caller even when the
-        # request is rejected at the IAM layer and never reaches the container
-        # -- the one failure mode the application logs cannot show.
-        service = self.service
         try:
-            response = requests.get(
-                f"{self.config_url}/v1/config/{environment}",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"service": service} if service else None,
-                timeout=_REQUEST_TIMEOUT_SECONDS,
+            snapshot = (
+                self._client()
+                .collection(COLLECTION)
+                .document(environment)
+                .get(timeout=READ_TIMEOUT_SECONDS)
             )
-            if response.status_code == 200:
-                self._values = response.json().get("values", {})
+        except Exception as exc:
+            # Serve stale values rather than failing the caller. `_values` is
+            # deliberately left untouched.
+            self._last_fetch_ok = False
+            self._last_fetch_detail = f"{type(exc).__name__}: {exc}"
+            # Drop the client so a broken channel is rebuilt on the next attempt.
+            self._firestore = None
+        else:
+            if snapshot.exists:
+                values = (snapshot.to_dict() or {}).get("values", {})
+                self._values = values if isinstance(values, dict) else {}
                 self._last_fetch_ok = True
                 self._last_fetch_detail = f"ok, {len(self._values)} keys"
-            elif response.status_code == 404:
+            else:
                 self._values = {}
                 self._last_fetch_ok = True
                 self._last_fetch_detail = "environment has no configuration document"
-            else:
-                self._last_fetch_ok = False
-                self._last_fetch_detail = (
-                    f"HTTP {response.status_code}: {_rejection_reason(response)}"
-                )
-                if response.status_code in (401, 403):
-                    # Token may have gone stale; drop it so the next re-mints.
-                    self._token = None
-                    self._token_expires_at = 0.0
-        except requests.RequestException as exc:
-            # Serve stale values rather than failing the caller.
-            self._last_fetch_ok = False
-            self._last_fetch_detail = f"{type(exc).__name__}: {exc}"
 
         if not self._last_fetch_ok:
-            # Logs are private, so unlike the diagnostics response these may
-            # name the URL and audience -- the two things a rejection usually
-            # comes down to.
             logger.warning(
-                "config fetch failed: %s (environment=%s url=%s audience=%s)",
+                "config fetch failed: %s (environment=%s project=%s)",
                 self._last_fetch_detail,
                 environment,
-                self.config_url,
-                self.audience,
+                self.project,
             )
         self._fetched_at = time.monotonic()
 
@@ -316,6 +232,17 @@ class ConfigClient:
             if time.monotonic() - self._fetched_at >= self._cache_ttl:
                 self._fetch()
             return self._values
+
+    def prime(self) -> None:
+        """Read the document now, so the first lookup does not pay for it.
+
+        Called at import. Failures are swallowed -- the client is fail-open, and
+        a service must still start when Firestore is unreachable.
+        """
+        try:
+            self._remote_values()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("config prime failed: %s", exc)
 
     def _resolve(self, key: str, default: Any = None) -> tuple[Any, str]:
         """Resolve a value and report which layer of the hierarchy supplied it."""
@@ -332,8 +259,8 @@ class ConfigClient:
 
         This is what makes a migration observable: once a service stops setting
         a variable in its own ENVVARs, the log line flips from `env` to
-        `config`, proving the value is being served by the config service
-        rather than merely fetched from it.
+        `config`, proving the value is being served by the configuration
+        document rather than merely readable from it.
         """
         if self._sources.get(key) == source:
             return
@@ -341,7 +268,7 @@ class ConfigClient:
         logger.info("config %s resolved from %s", key, source)
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Resolve a configuration value: ENVVAR, then remote config, then default."""
+        """Resolve a configuration value: ENVVAR, then config document, then default."""
         value, source = self._resolve(key, default)
         self._record_source(key, source)
         return value
@@ -350,13 +277,13 @@ class ConfigClient:
         """Return the value for `key` along with which layer supplied it.
 
         Intended for diagnostics -- during a migration, to confirm a value is
-        coming from the config service rather than a lingering ENVVAR.
+        coming from the configuration document rather than a lingering ENVVAR.
         """
         value, source = self._resolve(key, default)
         return {"key": key, "value": value, "source": source}
 
     def status(self) -> Dict[str, Any]:
-        """Report how the client is configured and how the last fetch went.
+        """Report how the client is configured and how the last read went.
 
         Contains no configuration values, so it is safe to expose on an
         operational diagnostics endpoint.
@@ -365,9 +292,9 @@ class ConfigClient:
         age = None if not self._fetched_at else round(time.monotonic() - self._fetched_at, 1)
         return {
             "environment": self.environment,
-            "config_url": self.config_url,
-            "audience": self.audience,
-            "service": self.service,
+            "project": self.project,
+            "database": DATABASE,
+            "collection": COLLECTION,
             "last_fetch_ok": self._last_fetch_ok,
             "last_fetch_detail": self._last_fetch_detail,
             "keys_available": len(self._values),
@@ -376,7 +303,7 @@ class ConfigClient:
         }
 
     def compare(self, key: str, default: Any = None) -> Dict[str, Any]:
-        """Compare the ENVVAR and remote values for a key WITHOUT revealing them.
+        """Compare the ENVVAR and config values for a key WITHOUT revealing them.
 
         Use this before removing a variable from a service's ENVVARs: when the
         key is present in config and `matches_env` is true, removing the ENVVAR
@@ -395,7 +322,7 @@ class ConfigClient:
         if in_config and default is not None:
             matches_default = str(remote[key]) == str(default)
 
-        # What the process would use if the config service supplied nothing.
+        # What the process would use if the config document supplied nothing.
         served = self._resolve(key, default)[0]
         without_config = env_value if in_env else default
         return {
@@ -405,7 +332,7 @@ class ConfigClient:
             "in_config": in_config,
             "matches_env": matches_env,
             "matches_default": matches_default,
-            # True when the config service is changing what this process uses.
+            # True when the config document is changing what this process uses.
             "changes_behaviour": str(served) != str(without_config),
             "safe_to_remove_envvar": bool(in_config and matches_env),
         }
@@ -415,7 +342,7 @@ class ConfigClient:
         return dict(self._sources)
 
     def all(self) -> Dict[str, Any]:
-        """Return the remote configuration document (env vars overlaid on top)."""
+        """Return the configuration document (env vars overlaid on top)."""
         merged = dict(self._remote_values())
         for key in merged:
             if key in os.environ:
@@ -423,7 +350,7 @@ class ConfigClient:
         return merged
 
     def refresh(self) -> None:
-        """Force a refetch on the next lookup."""
+        """Force a reread on the next lookup."""
         with self._lock:
             self._fetched_at = 0.0
 
@@ -442,12 +369,12 @@ def explain_config(key: str, default: Any = None) -> Dict[str, Any]:
 
 
 def config_status() -> Dict[str, Any]:
-    """Report client configuration and last fetch outcome (contains no values)."""
+    """Report client configuration and last read outcome (contains no values)."""
     return _default_client.status()
 
 
 def compare_config(key: str, default: Any = None) -> Dict[str, Any]:
-    """Compare ENVVAR and remote values for a key without revealing them."""
+    """Compare ENVVAR and config values for a key without revealing them."""
     return _default_client.compare(key, default)
 
 
@@ -456,14 +383,25 @@ def config_sources() -> Dict[str, str]:
     return _default_client.sources()
 
 
-def set_token_provider(provider: Callable[[], Optional[str]]) -> None:
-    """Override how the default client obtains tokens. Rarely needed."""
-    _default_client.set_token_provider(provider)
+def set_client_provider(provider: Callable[[], Any]) -> None:
+    """Supply the Firestore client the default client should read with."""
+    _default_client.set_client_provider(provider)
 
 
 def refresh() -> None:
-    """Force the default client to refetch on the next lookup."""
+    """Force the default client to reread on the next lookup."""
     _default_client.refresh()
+
+
+def prime() -> None:
+    """Read the configuration document now rather than on first lookup."""
+    _default_client.prime()
+
+
+# Read at import, so the cost lands in container startup -- where Cloud Run
+# grants a CPU boost -- instead of on whichever request arrives first.
+if os.environ.get("OPTERYX_CONFIG_EAGER", "true").strip().lower() != "false":
+    prime()
 
 
 __all__ = [
@@ -473,7 +411,10 @@ __all__ = [
     "config_sources",
     "config_status",
     "get_config",
-    "set_token_provider",
+    "set_client_provider",
     "refresh",
+    "prime",
     "CACHE_TTL_SECONDS",
+    "COLLECTION",
+    "DATABASE",
 ]
