@@ -19,7 +19,6 @@ dependencies = [
     "opteryx-core>=0.9.50,<0.10",
     "protobuf>=7.35.1,<8",
     "pyarrow==25.0.0",
-    "python-dateutil==2.9.0.post0post0",
     "python-jose[cryptography]==3.5.0",
     "requests==2.34.2",
 ]
