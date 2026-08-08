@@ -28,6 +28,9 @@ Environment:
   ``GCP_PROJECT_ID`` / ``GCP_PROJECT`` / ``GOOGLE_CLOUD_PROJECT``.
 - ``CONFIG_URL`` — config service URL (default ``https://config.opteryx.app``).
 - ``CONFIG_AUDIENCE`` — OIDC audience (defaults to ``CONFIG_URL``).
+- ``OPTERYX_SERVICE`` — this service's name, reported to the config service as
+  a ``?service=`` query parameter so its logs can attribute traffic. Falls back
+  to ``K_SERVICE`` / ``CLOUD_RUN_JOB``, both set automatically by Cloud Run.
 - ``OPTERYX_SERVICE_TOKEN`` — an explicit token that bypasses OIDC minting.
   Intended for local development and tests only.
 
@@ -41,6 +44,7 @@ import binascii
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -100,6 +104,31 @@ def _detect_environment() -> Optional[str]:
     )
 
 
+_SERVICE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+
+def _detect_service() -> Optional[str]:
+    """Name the calling service, for the config service's request log.
+
+    Cloud Run sets ``K_SERVICE`` on services and ``CLOUD_RUN_JOB`` on jobs;
+    neither exists outside Cloud Run, so this is None in local development and
+    the parameter is simply omitted.
+
+    The name is self-declared and unverifiable -- it is for attributing traffic
+    only, never for authorization. The config service authorizes on the OIDC
+    identity, which is the claim it can actually check.
+    """
+    name = (
+        os.environ.get("OPTERYX_SERVICE")
+        or os.environ.get("K_SERVICE")
+        or os.environ.get("CLOUD_RUN_JOB")
+        or ""
+    ).strip()
+    # Cloud Run's own service and job names always satisfy this; a hand-set
+    # OPTERYX_SERVICE might not, and a junk value is worse than no value.
+    return name if _SERVICE_NAME_PATTERN.match(name) else None
+
+
 def _token_expiry(token: str) -> Optional[float]:
     """Read ``exp`` from a JWT without verifying it.
 
@@ -142,10 +171,12 @@ class ConfigClient:
         audience: Optional[str] = None,
         token_provider: Optional[Callable[[], Optional[str]]] = None,
         cache_ttl: float = CACHE_TTL_SECONDS,
+        service: Optional[str] = None,
     ):
         self._environment = environment
         self._config_url = config_url
         self._audience = audience
+        self._service = service
         self._token_provider = token_provider
         self._cache_ttl = cache_ttl
         self._lock = threading.Lock()
@@ -169,6 +200,10 @@ class ConfigClient:
     @property
     def audience(self) -> str:
         return self._audience or os.environ.get("CONFIG_AUDIENCE") or self.config_url
+
+    @property
+    def service(self) -> Optional[str]:
+        return self._service or _detect_service()
 
     def set_token_provider(self, provider: Callable[[], Optional[str]]) -> None:
         """Override how tokens are obtained. Rarely needed; OIDC is automatic."""
@@ -226,10 +261,16 @@ class ConfigClient:
             self._fetched_at = time.monotonic()
             return
 
+        # Names this service in the config service's request log. That log is
+        # written by Cloud Run itself, so it records the caller even when the
+        # request is rejected at the IAM layer and never reaches the container
+        # -- the one failure mode the application logs cannot show.
+        service = self.service
         try:
             response = requests.get(
                 f"{self.config_url}/v1/config/{environment}",
                 headers={"Authorization": f"Bearer {token}"},
+                params={"service": service} if service else None,
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
             if response.status_code == 200:
@@ -326,6 +367,7 @@ class ConfigClient:
             "environment": self.environment,
             "config_url": self.config_url,
             "audience": self.audience,
+            "service": self.service,
             "last_fetch_ok": self._last_fetch_ok,
             "last_fetch_detail": self._last_fetch_detail,
             "keys_available": len(self._values),
