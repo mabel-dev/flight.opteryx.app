@@ -24,6 +24,7 @@ import requests
 from google.api_core import exceptions as gcp_exceptions  # type: ignore
 from google.cloud import secretmanager  # type: ignore
 from google.protobuf import timestamp_pb2
+from opteryx.utils.dates import parse_iso
 
 
 @lru_cache(maxsize=1)
@@ -111,13 +112,11 @@ def list_known_kids() -> list:
                 data = json.loads(payload)
                 kk = data.get("kid")
                 expires = data.get("expires")
-                # Only include if not expired (or if no expiry present)
+                # Only include if not expired (or if no expiry present).
+                # parse_iso returns None if the value isn't date-like, in which
+                # case we ignore the expiry and include.
                 if expires:
-                    try:
-                        exp_dt = datetime.datetime.fromisoformat(expires)
-                    except Exception:
-                        # If parsing fails, ignore expiry and include
-                        exp_dt = None
+                    exp_dt = parse_iso(expires)
                     if exp_dt and exp_dt < datetime.datetime.utcnow():
                         continue
                 if kk:
@@ -249,10 +248,7 @@ def load_key(kid: str) -> Optional[Tuple[str, str]]:
                     if data.get("kid") == desired_kid:
                         expires = data.get("expires")
                         if expires:
-                            try:
-                                exp_dt = datetime.datetime.fromisoformat(expires)
-                            except Exception:
-                                exp_dt = None
+                            exp_dt = parse_iso(expires)
                             if exp_dt and exp_dt < datetime.datetime.utcnow():
                                 continue
                         return data.get("pem")
@@ -314,10 +310,7 @@ def load_public_key(kid: str) -> Optional[str]:
             continue
         expires = data.get("expires")
         if expires:
-            try:
-                exp_dt = datetime.datetime.fromisoformat(expires)
-            except ValueError:
-                exp_dt = None
+            exp_dt = parse_iso(expires)
             if exp_dt and exp_dt < datetime.datetime.utcnow():
                 continue
         return data.get("pem")
@@ -356,10 +349,7 @@ def find_key_by_kid(kid: str) -> Optional[Tuple[str, str]]:
                     continue
                 expires = data.get("expires")
                 if expires:
-                    try:
-                        exp_dt = datetime.datetime.fromisoformat(expires)
-                    except ValueError:
-                        exp_dt = None
+                    exp_dt = parse_iso(expires)
                     if exp_dt and exp_dt < datetime.datetime.utcnow():
                         continue
                 pem = data.get("pem")
