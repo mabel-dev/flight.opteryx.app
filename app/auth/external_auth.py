@@ -18,6 +18,7 @@ from jose import jwt as jose_jwt
 from app.logging import get_logger
 
 from app.auth.errors import AuthError
+from app.config_client import get_config
 
 logger = get_logger()
 
@@ -43,7 +44,7 @@ def authenticate_with_external_service(username: str, password: str) -> Dict[str
         AuthError(401): Invalid credentials
         AuthError(503): Auth service unavailable or timeout
     """
-    auth_url = os.environ.get("AUTH_URL", "https://authenticate.opteryx.app")
+    auth_url = get_config("AUTH_URL", "https://authenticate.opteryx.app")
     token_endpoint = f"{auth_url.rstrip('/')}/token"
     timeout = float(os.environ.get("AUTH_SERVICE_TIMEOUT", "10"))
 

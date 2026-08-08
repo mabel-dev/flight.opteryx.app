@@ -31,7 +31,7 @@ from typing import Tuple
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../opteryx-core")))
 sys.path.insert(
-    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../pyiceberg-firestore-gcs"))
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../opteryx-catalog"))
 )
 
 import opteryx
@@ -48,21 +48,49 @@ from opteryx_catalog import OpteryxCatalog
 
 from app.auth.permissions import access_policies_for_query
 from app.auth.permissions import visibility_filters_from_claims
+from app.config_client import get_config
 from app.logging import get_logger
 
 logger = get_logger()
 
-FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE")
-BUCKET_NAME = os.environ.get("GCS_BUCKET")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 
-opteryx.set_default_connector(
-    OpteryxConnector,
-    catalog=OpteryxCatalog,
-    firestore_project=GCP_PROJECT_ID,
-    firestore_database=FIRESTORE_DATABASE,
-    gcs_bucket=BUCKET_NAME,
-)
+
+# Resolved per use, not at import. A module-level constant is evaluated once
+# at startup and then frozen for the life of the process, so config changes
+# would never reach it without a redeploy.
+def _firestore_database() -> str:
+    return get_config("FIRESTORE_DATABASE")
+
+
+def _bucket_name() -> str:
+    return get_config("GCS_BUCKET")
+
+
+def register_default_connector() -> None:
+    """(Re-)register the default connector with freshly resolved configuration.
+
+    `opteryx.connectors.set_default_connector` just rebinds a module-level
+    dict (see opteryx-core `opteryx/connectors/__init__.py`), so calling it
+    again is cheap and idempotent -- and it is the only way the connector's
+    own `firestore_database`/`gcs_bucket` can ever pick up a config change:
+    the registration captures those values by value, so a registration done
+    once at import stays frozen for the life of the process.
+
+    Called at import (below) to preserve the import-time side effect anything
+    else in the process may rely on, and again from `session_for_claims` so
+    every query re-resolves.
+    """
+    opteryx.set_default_connector(
+        OpteryxConnector,
+        catalog=OpteryxCatalog,
+        firestore_project=GCP_PROJECT_ID,
+        firestore_database=_firestore_database(),
+        gcs_bucket=_bucket_name(),
+    )
+
+
+register_default_connector()
 
 # Draken morsel size, not an Arrow batch size -- see execute_to_morsels's own
 # max_size default (65_536) in opteryx.query_session.
@@ -104,6 +132,9 @@ def session_for_claims(claims: Dict[str, Any]) -> "opteryx.query_session.Session
     equivalent guard upstream of this call; passing the real (possibly
     empty) list through is the only correct fix here.
     """
+    # Re-resolve FIRESTORE_DATABASE/GCS_BUCKET and re-register before every
+    # session, so a config change reaches the connector without a redeploy.
+    register_default_connector()
     identity = claims.get("identity")
     access_policies = access_policies_for_query(claims)
     billing_account = claims.get("billing_account")
