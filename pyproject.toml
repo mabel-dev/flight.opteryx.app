@@ -7,7 +7,7 @@ include = ["app*"]
 
 [project]
 name = "opteryx-flight"
-version = "0.0.1"
+version = "0.0.2"
 description = "Opteryx Arrow Flight SQL Service"
 requires-python = '>=3.14'
 dependencies = [
