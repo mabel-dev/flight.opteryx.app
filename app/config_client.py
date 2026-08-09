@@ -71,7 +71,20 @@ logger = logging.getLogger("opteryx.config_client")
 
 _METADATA_URL = "http://metadata.google.internal/computeMetadata/v1/project/project-id"
 _METADATA_TIMEOUT_SECONDS = 0.5
+# How long a failed probe is trusted before trying again. A success is cached
+# for the life of the process -- the project genuinely never changes -- but a
+# failure must expire: see `_metadata_project`.
+_METADATA_RETRY_SECONDS = 30.0
+
 _METADATA_PROJECT: Any = _UNSET  # cached; the project never changes for a process
+_METADATA_FAILED_AT: Optional[float] = None
+
+
+def reset_metadata_cache() -> None:
+    """Forget the cached project id, successful or not."""
+    global _METADATA_PROJECT, _METADATA_FAILED_AT
+    _METADATA_PROJECT = _UNSET
+    _METADATA_FAILED_AT = None
 
 
 def _metadata_project() -> Optional[str]:
@@ -79,8 +92,17 @@ def _metadata_project() -> Optional[str]:
 
     Cloud Run always provides this, so a service needs no environment variable
     to identify its own environment. Mirrors the approach the services already
-    use in their `secret_store` modules. The result is cached, including
-    failures, so a non-GCP host pays the timeout at most once.
+    use in their `secret_store` modules.
+
+    A SUCCESS is cached for the life of the process; the project never changes.
+    A FAILURE is cached only for `_METADATA_RETRY_SECONDS`. It used to be cached
+    forever, on the reasoning that a non-GCP host should pay the timeout at most
+    once -- which is right for a host that will never have a metadata server and
+    wrong for one that is merely slow to start. The first probe happens at
+    import, with half a second of patience, which is the least forgiving moment
+    in a container's life; one miss there and `environment` was None for that
+    instance forever, every value silently fell back to an ENVVAR or a default,
+    and only a new instance recovered.
 
     Deliberately not `google.auth.default()`: that probes the metadata server
     with a 3-second timeout and three retries, so a host with neither metadata
@@ -88,9 +110,13 @@ def _metadata_project() -> Optional[str]:
     around nine seconds. Since the document is read at import, that would be
     nine seconds of startup hang in every service that vendors this module.
     """
-    global _METADATA_PROJECT
-    if _METADATA_PROJECT is not _UNSET:
+    global _METADATA_PROJECT, _METADATA_FAILED_AT
+    if _METADATA_PROJECT is not _UNSET and _METADATA_PROJECT is not None:
         return _METADATA_PROJECT
+    if _METADATA_FAILED_AT is not None and (
+        time.monotonic() - _METADATA_FAILED_AT < _METADATA_RETRY_SECONDS
+    ):
+        return None
 
     project = None
     try:
@@ -108,6 +134,7 @@ def _metadata_project() -> Optional[str]:
         project = None
 
     _METADATA_PROJECT = project
+    _METADATA_FAILED_AT = None if project else time.monotonic()
     return project
 
 
@@ -138,7 +165,8 @@ class ConfigClient:
         self._lock = threading.Lock()
         self._firestore: Any = None
         self._values: Dict[str, Any] = {}
-        self._fetched_at: float = 0.0
+        # None, not 0.0 -- see `_remote_values`.
+        self._fetched_at: Optional[float] = None
         self._sources: Dict[str, str] = {}
         self._last_fetch_ok: Optional[bool] = None
         self._last_fetch_detail: str = "no fetch attempted"
@@ -211,8 +239,21 @@ class ConfigClient:
                 self._last_fetch_ok = True
                 self._last_fetch_detail = f"ok, {len(self._values)} keys"
             else:
+                # NOT `last_fetch_ok = True`. The gRPC call succeeded, but the
+                # caller's question is "is my configuration in effect", and the
+                # answer here is no. Reporting success meant a wrong database or
+                # a mistyped document id logged nothing, `status()` said the read
+                # was fine, and the service served defaults indefinitely while
+                # looking healthy. The two likeliest misconfigurations were the
+                # two least visible.
                 self._values = {}
-                self._last_fetch_ok = True
+                self._last_fetch_ok = False
+                # Wording deliberately unchanged. Consumers allowlist this exact
+                # string as safe to echo (see register.opteryx's `_redact`), and
+                # the document path is already available as structured fields on
+                # `status()` - putting it in here too would both break those
+                # allowlists and push a project name into a field they redact
+                # precisely to keep project names out.
                 self._last_fetch_detail = "environment has no configuration document"
 
         if not self._last_fetch_ok:
@@ -226,10 +267,22 @@ class ConfigClient:
 
     def _remote_values(self) -> Dict[str, Any]:
         with self._lock:
-            # `_fetched_at` starts at zero, so the first lookup always fetches.
-            # It is stamped on every attempt including failures, so an outage
-            # is retried once per TTL rather than on every single lookup.
-            if time.monotonic() - self._fetched_at >= self._cache_ttl:
+            # `is None` means never fetched. This used to be `_fetched_at = 0.0`
+            # and arithmetic alone, on the reasoning that "starts at zero, so the
+            # first lookup always fetches" -- which holds only if
+            # `time.monotonic()` returns something larger than the TTL. Python
+            # documents its reference point as undefined, and a fresh container
+            # sandbox starts it near zero, so for the first `cache_ttl` seconds
+            # of a container's life the subtraction stayed under the threshold,
+            # no read was ever attempted, and the client served an empty
+            # document while reporting no error.
+            #
+            # `_fetched_at` is stamped on every attempt including failures, so an
+            # outage is retried once per TTL rather than on every single lookup.
+            if (
+                self._fetched_at is None
+                or time.monotonic() - self._fetched_at >= self._cache_ttl
+            ):
                 self._fetch()
             return self._values
 
@@ -289,7 +342,10 @@ class ConfigClient:
         operational diagnostics endpoint.
         """
         self._remote_values()  # ensure at least one attempt has been made
-        age = None if not self._fetched_at else round(time.monotonic() - self._fetched_at, 1)
+        # `is None`, so an age of exactly 0.0 is not reported as "never fetched".
+        age = (
+            None if self._fetched_at is None else round(time.monotonic() - self._fetched_at, 1)
+        )
         return {
             "environment": self.environment,
             "project": self.project,
@@ -350,9 +406,17 @@ class ConfigClient:
         return merged
 
     def refresh(self) -> None:
-        """Force a reread on the next lookup."""
+        """Force a reread on the next lookup.
+
+        Also forgets a failed metadata probe: an environment that could not be
+        detected is one of the reasons a caller reaches for this, and resetting
+        only the document timer would leave it undetectable.
+        """
+        reset_metadata_cache()
         with self._lock:
-            self._fetched_at = 0.0
+            # None, not 0.0 -- resetting to 0.0 left this unable to force
+            # anything at all for the first `cache_ttl` seconds of a container.
+            self._fetched_at = None
 
 
 _default_client = ConfigClient()
@@ -414,6 +478,7 @@ __all__ = [
     "set_client_provider",
     "refresh",
     "prime",
+    "reset_metadata_cache",
     "CACHE_TTL_SECONDS",
     "COLLECTION",
     "DATABASE",
