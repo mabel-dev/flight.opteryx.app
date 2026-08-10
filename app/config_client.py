@@ -28,6 +28,13 @@ gRPC call on a client the service is already holding open.
 The document is read once at import, so the first lookup does not pay for it.
 Set ``OPTERYX_CONFIG_EAGER=false`` to skip that and fetch lazily instead.
 
+Also at import, every value in the document is copied into ``os.environ``
+without overwriting anything already set there — see ``promote_to_environ``.
+That is what reaches code which cannot call ``get_config``: ``opteryx.config``
+and ``opteryx_catalog`` read ``os.environ`` directly, at import, and are shared
+beyond the fleet, so nothing in the configuration document would otherwise be
+visible to the query engine running inside a service.
+
 Environment:
 
 - ``OPTERYX_ENVIRONMENT`` — the environment (GCP project) name, which is the
@@ -37,18 +44,21 @@ Environment:
   document. Defaults to the service's own project, which is correct whenever
   the service reads the configuration for the project it runs in.
 - ``OPTERYX_CONFIG_EAGER`` — set to ``false`` to skip the read at import.
+- ``OPTERYX_CONFIG_PROMOTE`` — set to ``false`` to skip the copy into
+  ``os.environ`` at import.
 
 The client is deliberately fail-open: if Firestore is unreachable it serves the
 last-known values (even if stale) and otherwise the caller's default, so a
 Firestore blip cannot take down the fleet.
 """
 
+import json
 import logging
 import os
 import threading
 import time
 import urllib.request
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 CACHE_TTL_SECONDS = 300.0
 
@@ -62,9 +72,10 @@ DATABASE = "(default)"
 
 _UNSET = object()
 
-ENV = "env"          # value came from the process's own environment
-CONFIG = "config"    # value came from the configuration document
-DEFAULT = "default"  # value came from the caller's fallback
+ENV = "env"              # value came from the process's own environment
+CONFIG = "config"        # value came from the configuration document
+DEFAULT = "default"      # value came from the caller's fallback
+PROMOTED = "promoted"    # value came from the document, via `promote_to_environ`
 
 logger = logging.getLogger("opteryx.config_client")
 
@@ -148,6 +159,51 @@ def _detect_environment() -> Optional[str]:
     )
 
 
+def _is_environ_name(key: Any) -> bool:
+    """Can `key` be used as an environment variable name at all?
+
+    `os.environ` rejects `=` and NUL outright (`putenv` cannot express either),
+    so a document with such a field would otherwise turn promotion into a
+    `ValueError` at import and take the service down. Anything else is allowed
+    through: lowercase or dotted names are unconventional rather than illegal,
+    and silently dropping them would hide a key the operator can see in the
+    document.
+    """
+    return isinstance(key, str) and key != "" and "=" not in key and "\0" not in key
+
+
+def _environ_value(value: Any) -> Optional[str]:
+    """Render a configuration value as an environment variable string.
+
+    Firestore documents hold real types -- booleans, numbers, maps, arrays --
+    while the environment holds only text, so promotion has to choose a
+    rendering. `None` returns `None`, meaning "do not promote": a variable set
+    to the string ``"None"`` reads as present-and-set to every consumer, which
+    is worse than absent.
+
+    Booleans render lowercase (``"true"`` / ``"false"``) rather than as Python's
+    ``"True"``: consumers written against environment variables test for the
+    lowercase spelling (`opteryx.config.get_bool` accepts either, but the common
+    `value.lower() == "true"` idiom in the services does not).
+
+    Maps and arrays render as JSON, which is how services already pass
+    structured settings through the environment (`KVSTORE_LAYERS` is parsed with
+    `json.loads`).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value)
+        except (TypeError, ValueError):
+            return None
+    return str(value)
+
+
 class ConfigClient:
     """Reads and caches an environment's configuration document from Firestore."""
 
@@ -170,14 +226,52 @@ class ConfigClient:
         self._sources: Dict[str, str] = {}
         self._last_fetch_ok: Optional[bool] = None
         self._last_fetch_detail: str = "no fetch attempted"
+        # Keys this client wrote into `os.environ`, and what it wrote. Kept so
+        # the diagnostics can tell a value the deployment set from one this
+        # client put there -- see `_resolve` and `compare`.
+        self._promoted: Dict[str, str] = {}
+        # Latched once resolution succeeds -- see `environment`.
+        self._detected_environment: Optional[str] = None
+        self._detected_project: Optional[str] = None
 
     @property
     def environment(self) -> Optional[str]:
-        return self._environment or _detect_environment()
+        """The environment whose document this client reads.
+
+        Latched after the first successful detection, because promotion makes
+        this self-referential otherwise: the document id is derived from
+        `GCP_PROJECT_ID` among others, and `GCP_PROJECT_ID` is a perfectly
+        reasonable thing for a document to contain (the worker reads it for its
+        Firestore and GCS clients). Without the latch, promoting it would move
+        the client to a different document at the next refresh -- the service
+        would boot on one environment's configuration and silently switch to
+        another five minutes later.
+
+        Only a successful detection latches. A failed metadata probe must stay
+        retryable, which is the whole point of `_METADATA_RETRY_SECONDS`.
+        """
+        if self._environment:
+            return self._environment
+        if self._detected_environment is None:
+            self._detected_environment = _detect_environment()
+        return self._detected_environment
 
     @property
     def project(self) -> Optional[str]:
-        return self._project or os.environ.get("CONFIG_PROJECT") or _metadata_project()
+        """The GCP project whose Firestore holds the document.
+
+        Latched for the same reason as `environment`: a document containing
+        `CONFIG_PROJECT` would otherwise move the client to a different
+        project's Firestore once promoted. Latching is what lets promotion stay
+        unconditional -- every key in the document reaches `os.environ`,
+        including these, without any of them being able to redirect the read
+        they came from.
+        """
+        if self._project:
+            return self._project
+        if self._detected_project is None:
+            self._detected_project = os.environ.get("CONFIG_PROJECT") or _metadata_project()
+        return self._detected_project
 
     def set_client_provider(self, provider: Callable[[], Any]) -> None:
         """Supply the Firestore client to read with.
@@ -297,10 +391,96 @@ class ConfigClient:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("config prime failed: %s", exc)
 
+    def promote_to_environ(self) -> List[str]:
+        """Copy every value in the configuration document into `os.environ`.
+
+        A variable already set in the process environment is never overwritten,
+        so the resolution hierarchy is preserved exactly: a deployment's own
+        ENVVAR still wins over the document.
+
+        This exists for code that cannot call `get_config` -- libraries shared
+        beyond the fleet, which read `os.environ` directly and have no business
+        depending on Firestore or on this module. `opteryx.config` is the case
+        that forced it: it resolves around forty settings
+        (`MAX_EXECUTION_WORKERS`, `PARQUET_GCS_IO_WORKERS`, `KVSTORE_LOCATION`,
+        the manifest and footer cache locations, ...) into module-level
+        constants, so a service could hold a perfectly good configuration
+        document and the engine inside it would never see a single value.
+        `opteryx_catalog` reads the environment the same way.
+
+        Two consequences of those constants, both of which shape how this must
+        be called:
+
+        - **Call it before importing anything that snapshots the environment.**
+          Those constants are bound at import and never re-read, so promoting
+          after `import opteryx` changes nothing at all.
+        - **A promoted value does not track the document.** It is written once;
+          the 5 minute refresh does not rewrite it, because the consumer
+          snapshotted it at import and rewriting would only make `os.environ`
+          disagree with what the process is actually using. Changing one of
+          these settings means a restart, exactly as it did when it was a
+          deployment ENVVAR.
+
+        Values are rendered for the environment by `_environ_value`; a null in
+        the document is skipped rather than promoted as `"None"`.
+
+        Returns the names promoted by this call, sorted. Calling it again
+        promotes only keys that have since appeared in the document and are
+        still absent from the environment.
+        """
+        values = self._remote_values()  # takes `_lock`, so read before acquiring
+
+        promoted: List[str] = []
+        unusable: List[str] = []
+        skipped_null: List[str] = []
+        with self._lock:
+            for key, value in values.items():
+                if not _is_environ_name(key):
+                    unusable.append(repr(key))
+                    continue
+                if key in os.environ:
+                    continue
+                text = _environ_value(value)
+                if text is None:
+                    skipped_null.append(key)
+                    continue
+                os.environ[key] = text
+                self._promoted[key] = text
+                promoted.append(key)
+
+        # Names only, never values: this is the same reasoning that keeps
+        # `status()` safe to expose.
+        if promoted:
+            logger.info(
+                "config promoted %d keys to environ: %s",
+                len(promoted),
+                ", ".join(sorted(promoted)),
+            )
+        if unusable:
+            logger.warning(
+                "config keys unusable as environment variable names, not promoted: %s",
+                ", ".join(sorted(unusable)),
+            )
+        if skipped_null:
+            logger.warning(
+                "config keys are null, not promoted: %s", ", ".join(sorted(skipped_null))
+            )
+        return sorted(promoted)
+
+    def _promoted_by_us(self, key: str, env_value: Any) -> bool:
+        """Is this environment value one this client wrote, and still untouched?"""
+        return env_value is not _UNSET and self._promoted.get(key) == env_value
+
     def _resolve(self, key: str, default: Any = None) -> tuple[Any, str]:
         """Resolve a value and report which layer of the hierarchy supplied it."""
         env_value = os.environ.get(key, _UNSET)
         if env_value is not _UNSET:
+            # Reported as `promoted`, not `env`. The value did come out of
+            # `os.environ`, but this client is what put it there and the
+            # document is where it came from -- calling that `env` would make
+            # the source log claim a deployment ENVVAR that does not exist.
+            if self._promoted_by_us(key, env_value):
+                return env_value, PROMOTED
             return env_value, ENV
         remote = self._remote_values()
         if key in remote:
@@ -354,6 +534,7 @@ class ConfigClient:
             "last_fetch_ok": self._last_fetch_ok,
             "last_fetch_detail": self._last_fetch_detail,
             "keys_available": len(self._values),
+            "keys_promoted": len(self._promoted),
             "seconds_since_fetch": age,
             "cache_ttl_seconds": self._cache_ttl,
         }
@@ -367,6 +548,12 @@ class ConfigClient:
         """
         remote = self._remote_values()
         env_value = os.environ.get(key, _UNSET)
+        # A promoted key is in `os.environ` because this client put it there, so
+        # counting it as `in_env` would report every promoted key as a
+        # deployment ENVVAR that matches config and is therefore "safe to
+        # remove" -- advice about a variable nobody set.
+        if self._promoted_by_us(key, env_value):
+            env_value = _UNSET
         in_env = env_value is not _UNSET
         in_config = key in remote
 
@@ -411,6 +598,14 @@ class ConfigClient:
         Also forgets a failed metadata probe: an environment that could not be
         detected is one of the reasons a caller reaches for this, and resetting
         only the document timer would leave it undetectable.
+
+        The latches in `environment` and `project` are deliberately NOT cleared,
+        and do not need to be: only a successful resolution latches, so the case
+        this method exists to rescue -- detection that returned nothing -- was
+        never latched and re-resolves on the next access anyway. Clearing them
+        would instead hand an explicit refresh the one power the latch exists to
+        deny it: re-deriving the document's location from values promoted out of
+        that same document.
         """
         reset_metadata_cache()
         with self._lock:
@@ -462,10 +657,28 @@ def prime() -> None:
     _default_client.prime()
 
 
+def promote_to_environ() -> List[str]:
+    """Copy the configuration document into `os.environ`, never overwriting."""
+    return _default_client.promote_to_environ()
+
+
 # Read at import, so the cost lands in container startup -- where Cloud Run
 # grants a CPU boost -- instead of on whichever request arrives first.
 if os.environ.get("OPTERYX_CONFIG_EAGER", "true").strip().lower() != "false":
     prime()
+    # ...and promoted here, not left to the service, because "before anything
+    # that snapshots the environment at import" is a rule no service can keep
+    # reliably by hand: `opteryx.config` binds its constants the moment
+    # `opteryx` is imported, and isort is free to reorder the import that was
+    # carefully placed above it. Importing this module is the one hook that is
+    # always early enough -- every service already imports it during startup,
+    # and it has no imports of its own that read configuration.
+    #
+    # Nested inside the eager branch on purpose: promoting needs the document,
+    # so a service (or a test) that turned the import-time read off would
+    # otherwise get it back here, network call and all.
+    if os.environ.get("OPTERYX_CONFIG_PROMOTE", "true").strip().lower() != "false":
+        promote_to_environ()
 
 
 __all__ = [
@@ -475,6 +688,7 @@ __all__ = [
     "config_sources",
     "config_status",
     "get_config",
+    "promote_to_environ",
     "set_client_provider",
     "refresh",
     "prime",
