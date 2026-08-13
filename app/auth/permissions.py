@@ -105,16 +105,38 @@ def billing_account_from_claims(claims: Dict[str, Any]) -> Optional[str]:
     return billing_account or None
 
 
-# The base table holding billing events. Row-level filters MUST be keyed on this and
-# not on the views built over it (opteryx.ops.query_count_billing, storage_billing,
-# processed_billing). Opteryx expands a view into scans of its underlying tables before
-# the binder applies visibility filters, and the expansion randomises the view's alias
-# but not the relation name — so a filter keyed on a view name matches no scan at all.
-# Because unmatched relations are NOT filtered (see below), that failure is silent.
-# Filtering the base table is also the correct semantics: rows are restricted before
-# the views aggregate, so the totals are per-account rather than per-account slices of
-# a global total.
+# The base table holding billing events.
 BILLING_RELATION = "opteryx.ops.billing"
+
+# The daily rollups over it. These are MATERIALIZED views — real tables the engine
+# scans by name — so each one needs its own row-level filter.
+#
+# When they were plain views a filter keyed on BILLING_RELATION alone was both
+# sufficient and required: Opteryx expands a view into scans of its underlying tables
+# before the binder applies visibility filters, so a filter keyed on a view name
+# matched no scan. Materializing them inverts that. A query against a rollup now scans
+# the rollup, never the base table, so the BILLING_RELATION entry matches nothing and —
+# because unmatched relations are NOT filtered (see below) — every account's rows are
+# served. The failure is silent either way, which is why both keys are held here rather
+# than one being dropped as redundant.
+#
+# Filtering after aggregation is only safe because `billing_account` is a GROUP BY key
+# in all four definitions: every row of every rollup belongs to exactly one account, so
+# scoping the output equals scoping the input. A future rollup that does NOT group by
+# billing_account cannot be secured this way and must not be added to this tuple.
+BILLING_ROLLUP_RELATIONS = (
+    "opteryx.ops.query_count_billing",
+    "opteryx.ops.storage_billing",
+    "opteryx.ops.processed_billing",
+    # AI assistant usage (tokens, conversation turns, describes). Reports usage
+    # only — the cost column is a literal zero because AI is not charged for yet.
+    "opteryx.ops.ai_usage_billing",
+)
+
+# Every relation carrying a `billing_account` column that a caller may reach. Both the
+# reader grants and the row-level filters are derived from this, so a rollup added
+# above is covered by both without anyone having to remember the second one.
+BILLING_RELATIONS = (BILLING_RELATION, *BILLING_ROLLUP_RELATIONS)
 
 # Relations any AUTHENTICATED caller may read, regardless of the policies in their token.
 # This is deliberately not the same as anonymous access (see ANONYMOUS_EXEMPT_PAIRS):
@@ -123,14 +145,14 @@ BILLING_RELATION = "opteryx.ops.billing"
 # to and so must get nothing — see visibility_filters_from_claims, which denies rather
 # than allows when the account is unknown.
 #
-# The views are listed alongside the base table because table-level permission is checked
-# against the relation named in the plan, which is the view when a view is queried.
-AUTHENTICATED_READ_RELATIONS = (
-    BILLING_RELATION,
-    "opteryx.ops.query_count_billing",
-    "opteryx.ops.storage_billing",
-    "opteryx.ops.processed_billing",
-)
+# Deliberately the rollups only, not BILLING_RELATION itself: a caller needs their
+# account's aggregated usage/cost, never the raw per-query-event table (which carries
+# the submitted SQL and the submitting user). Reading the raw table still requires an
+# explicit reader policy in the caller's own token (or the data_admin exemption) — this
+# blanket grant does not extend to it. It still gets a row-level filter below regardless
+# (see visibility_filters_from_claims), since that path is keyed off BILLING_RELATIONS
+# independently and must stay fail-safe for whoever *does* hold an explicit grant on it.
+AUTHENTICATED_READ_RELATIONS = BILLING_ROLLUP_RELATIONS
 
 
 def access_policies_for_query(claims: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -168,9 +190,13 @@ def visibility_filters_from_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
 
     Opteryx keys these by relation name and applies them only to relations present in
     the dict — an absent relation is returned UNFILTERED. That makes this fail-open, so
-    the billing relation is always given an entry: either a real predicate, or one that
-    matches nothing. Never return `{}` for a caller we cannot identify; that would serve
-    every account's billing data rather than none of it.
+    every billing relation is always given an entry: either a real predicate, or one
+    that matches nothing. Never return `{}` for a caller we cannot identify; that would
+    serve every account's billing data rather than none of it.
+
+    Both the base table and the materialized rollups are keyed, because which one a
+    query scans depends on which one it names — the rollups no longer expand into the
+    base table.
 
     Filters for relations the query never touches cost nothing, so this is applied to
     every request rather than being special-cased per endpoint.
@@ -187,7 +213,8 @@ def visibility_filters_from_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
 
     billing_account = claims.get("billing_account") or _DENY_ALL_ACCOUNT
 
-    return {BILLING_RELATION: [("billing_account", "Eq", billing_account)]}
+    predicate = [("billing_account", "Eq", billing_account)]
+    return {relation: list(predicate) for relation in BILLING_RELATIONS}
 
 
 def convert_policies_for_opteryx(policies: Optional[list]) -> List[Dict[str, str]]:
