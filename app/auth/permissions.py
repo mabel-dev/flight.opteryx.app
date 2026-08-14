@@ -105,54 +105,31 @@ def billing_account_from_claims(claims: Dict[str, Any]) -> Optional[str]:
     return billing_account or None
 
 
-# The base table holding billing events.
-BILLING_RELATION = "opteryx.ops.billing"
-
-# The daily rollups over it. These are MATERIALIZED views — real tables the engine
-# scans by name — so each one needs its own row-level filter.
+# Every relation under the tenant-facing billing namespace. A PATTERN, not an
+# enumeration: `apply_visibility_filters` in opteryx-core fnmatches keys that hold a
+# glob metacharacter, so this covers relations that do not exist yet.
 #
-# When they were plain views a filter keyed on BILLING_RELATION alone was both
-# sufficient and required: Opteryx expands a view into scans of its underlying tables
-# before the binder applies visibility filters, so a filter keyed on a view name
-# matched no scan. Materializing them inverts that. A query against a rollup now scans
-# the rollup, never the base table, so the BILLING_RELATION entry matches nothing and —
-# because unmatched relations are NOT filtered (see below) — every account's rows are
-# served. The failure is silent either way, which is why both keys are held here rather
-# than one being dropped as redundant.
+# That is the point. The enumerated list this replaces was fail-open by construction —
+# a relation nobody remembered to add was served UNFILTERED, silently — and it had
+# already drifted between these three services once, leaving the Flight door serving
+# every account's rollup rows. A namespace cannot drift.
 #
-# Filtering after aggregation is only safe because `billing_account` is a GROUP BY key
-# in all four definitions: every row of every rollup belongs to exactly one account, so
-# scoping the output equals scoping the input. A future rollup that does NOT group by
-# billing_account cannot be secured this way and must not be added to this tuple.
-BILLING_ROLLUP_RELATIONS = (
-    "opteryx.ops.query_count_billing",
-    "opteryx.ops.storage_billing",
-    "opteryx.ops.processed_billing",
-    # AI assistant usage (tokens, conversation turns, describes). Reports usage
-    # only — the cost column is a literal zero because AI is not charged for yet.
-    "opteryx.ops.ai_usage_billing",
-)
+# The admission rule this relies on: EVERY relation in `platform.billing.*` carries a
+# `billing_account` column. One that cannot raises ColumnNotFoundError rather than
+# serving rows, so a new dataset that forgets the column breaks loudly on first query
+# instead of leaking every tenant quietly.
+BILLING_NAMESPACE = "platform.billing.*"
 
-# Every relation carrying a `billing_account` column that a caller may reach. Both the
-# reader grants and the row-level filters are derived from this, so a rollup added
-# above is covered by both without anyone having to remember the second one.
-BILLING_RELATIONS = (BILLING_RELATION, *BILLING_ROLLUP_RELATIONS)
-
-# Relations any AUTHENTICATED caller may read, regardless of the policies in their token.
-# This is deliberately not the same as anonymous access (see ANONYMOUS_EXEMPT_PAIRS):
-# row-level filtering scopes these to the caller's own billing account, which is only
-# possible once we know who the caller is. An anonymous caller has no account to scope
-# to and so must get nothing — see visibility_filters_from_claims, which denies rather
-# than allows when the account is unknown.
+# Relations any AUTHENTICATED caller may read, regardless of the policies in their
+# token. Deliberately NARROWER than the filter above: the filter is fail-safe and
+# covers the whole namespace, the grant is what a tenant actually needs.
 #
-# Deliberately the rollups only, not BILLING_RELATION itself: a caller needs their
-# account's aggregated usage/cost, never the raw per-query-event table (which carries
-# the submitted SQL and the submitting user). Reading the raw table still requires an
-# explicit reader policy in the caller's own token (or the data_admin exemption) — this
-# blanket grant does not extend to it. It still gets a row-level filter below regardless
-# (see visibility_filters_from_claims), since that path is keyed off BILLING_RELATIONS
-# independently and must stay fail-safe for whoever *does* hold an explicit grant on it.
-AUTHENTICATED_READ_RELATIONS = BILLING_ROLLUP_RELATIONS
+# `charges_daily` only. The namespace also holds the raw event stream
+# (`platform.billing.events`, which carries submitted SQL and the submitting user),
+# the account-state and attribution snapshots, and the intermediate usage rollups.
+# None of those are a tenant's business; all of them stay behind an explicit reader
+# policy or the data_admin exemption, while remaining row-filtered regardless.
+AUTHENTICATED_READ_RELATIONS = ("platform.billing.charges_daily",)
 
 
 def access_policies_for_query(claims: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -213,8 +190,7 @@ def visibility_filters_from_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
 
     billing_account = claims.get("billing_account") or _DENY_ALL_ACCOUNT
 
-    predicate = [("billing_account", "Eq", billing_account)]
-    return {relation: list(predicate) for relation in BILLING_RELATIONS}
+    return {BILLING_NAMESPACE: [("billing_account", "Eq", billing_account)]}
 
 
 def convert_policies_for_opteryx(policies: Optional[list]) -> List[Dict[str, str]]:
