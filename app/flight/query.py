@@ -260,6 +260,19 @@ class ResultCache:
                 schema=schema, batches=batches, total_rows=total_rows, expires_at=now + self._ttl_seconds
             )
 
+    def peek(self, handle: bytes) -> Optional[_CacheEntry]:
+        """Return the cached result for `handle` without consuming it.
+
+        Used by the prepared statement path, where the result is executed once
+        at ActionCreatePreparedStatement time (to fill in `dataset_schema`) and
+        then read again by the GetFlightInfo that follows -- which needs the
+        schema but must leave the entry in place for the DoGet after it.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._evict_expired(now)
+            return self._entries.get(handle)
+
     def pop(self, handle: bytes) -> Optional[_CacheEntry]:
         now = time.monotonic()
         with self._lock:

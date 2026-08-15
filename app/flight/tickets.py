@@ -91,6 +91,57 @@ def decode_statement_handle(handle: bytes) -> Tuple[str, Dict[str, Any]]:
         raise InvalidTicket("Ticket payload is malformed") from exc
 
 
+# Prepared statements (ActionCreatePreparedStatement -> CommandPreparedStatementQuery)
+# reuse the same (sql, claims) payload as a statement ticket, but they are not
+# interchangeable with one and must not be treated as such:
+#
+#  * Lifetime. A statement ticket bridges a single GetFlightInfo -> DoGet pair
+#    and expires in minutes. A prepared statement is held open by the client
+#    for as long as the JDBC/ODBC `PreparedStatement` object lives, and may be
+#    executed many times, so it gets its own (longer) TTL.
+#  * Confusion resistance. A `kind` marker means a handle minted for one role
+#    can't be redeemed in the other, even though both decrypt with the same key.
+PREPARED_HANDLE_TTL_SECONDS = 3600
+
+
+def _prepared_ttl_seconds() -> int:
+    return int(os.environ.get("FLIGHT_PREPARED_TTL_SECONDS", PREPARED_HANDLE_TTL_SECONDS))
+
+
+def encode_prepared_handle(sql: str, claims: Dict[str, Any]) -> bytes:
+    """Mint an opaque `prepared_statement_handle` carrying `(sql, claims)`.
+
+    As with statement tickets, the claims are captured here -- at prepare
+    time -- and reused for every execution of this handle, rather than being
+    re-read from whatever headers accompany the later
+    CommandPreparedStatementQuery call. Same reasoning as `app.flight.server`:
+    the caller was authorized once, and a later call must not be able to
+    execute the statement under different (or absent) claims.
+    """
+    payload = json.dumps(
+        {"kind": "prepared", "sql": sql, "claims": claims}, separators=(",", ":")
+    ).encode("utf-8")
+    return _FERNET.encrypt(payload)
+
+
+def decode_prepared_handle(handle: bytes) -> Tuple[str, Dict[str, Any]]:
+    """Recover `(sql, claims)` from a handle minted by `encode_prepared_handle`.
+
+    Raises `InvalidTicket` if the handle is malformed, tampered with, expired,
+    or is a statement/metadata ticket rather than a prepared statement handle.
+    """
+    try:
+        payload = _FERNET.decrypt(handle, ttl=_prepared_ttl_seconds())
+        data = json.loads(payload)
+        if data.get("kind") != "prepared":
+            raise InvalidTicket("Handle is not a prepared statement handle")
+        return data["sql"], data["claims"]
+    except InvalidToken as exc:
+        raise InvalidTicket("Handle is invalid, tampered with, or expired") from exc
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise InvalidTicket("Handle payload is malformed") from exc
+
+
 # Metadata commands (GetCatalogs/GetDbSchemas/GetTables/GetTableTypes/GetSqlInfo)
 # have no Flight-SQL-mandated ticket message type of their own -- only
 # CommandStatementQuery does (TicketStatementQuery, handled above). Their

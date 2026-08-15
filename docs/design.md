@@ -29,9 +29,10 @@ the metadata calls a JDBC/ODBC driver needs on connect.
 - No writes: `CommandStatementUpdate`, `DoPut`-based ingestion, and
   transactions are out of scope. This is a read path only, mirroring
   `odata.opteryx`'s read-only surface.
-- No `CommandPreparedStatementQuery` (parameterized/prepared statements).
-  Every query is issued as a one-shot `CommandStatementQuery`. Add prepared
-  statements in v2 once the basic path is proven against real drivers.
+- No bind parameters. `CommandPreparedStatementQuery` *is* supported —
+  see "Prepared statements" below — but every statement advertises an empty
+  parameter schema and its SQL is executed as written. Parameter binding is
+  deferred until a client actually needs it.
 - No mTLS. Cloud Run terminates TLS at its front end; auth is the same
   bearer-JWT scheme `odata.opteryx` already uses, carried in Flight per-call
   headers instead of an HTTP `Authorization` header.
@@ -73,6 +74,9 @@ version first.
 | Flight SQL command | Purpose | Backed by |
 |---|---|---|
 | `CommandStatementQuery` | Execute a SQL string, return results | opteryx `Session`, same as `interface.py` |
+| `CommandPreparedStatementQuery` | Execute a previously prepared statement | same path as `CommandStatementQuery` |
+| `CreatePreparedStatement` (action) | Prepare a SQL string, return a handle | executes eagerly to fill `dataset_schema` |
+| `ClosePreparedStatement` (action) | Release a prepared statement | drops the cached result; no server-side object |
 | `CommandGetSqlInfo` | Server capabilities (used by drivers on connect) | static/near-static response |
 | `CommandGetCatalogs` | List catalogs | `OpteryxCatalog`, same data as `service_document.py` |
 | `CommandGetDbSchemas` | List schemas | `OpteryxCatalog` |
@@ -85,6 +89,48 @@ and returns a `FlightInfo` describing the result schema and one
 is then called with that ticket to stream the actual Arrow data. This two-step
 shape is Flight's normal request pattern, not something specific to SQL
 commands.
+
+## Prepared statements
+
+Added after v1 was deployed, for one reason: **the JDBC/ODBC compatibility
+this whole service exists for does not work without them.** A live ADBC
+smoke test against the deployed v1 passed on queries, `GetCatalogs`, and
+`GetTables`, but failed on `adbc_prepare`:
+
+```
+INVALID_STATE: [Flight SQL Statement] must call Prepare before GetParameterSchema
+```
+
+JDBC and ODBC drivers route nearly everything through `PreparedStatement`,
+including schema introspection. A server answering only
+`CommandStatementQuery` is reachable from ADBC and hand-written clients, but
+not from DataGrip or DBeaver — i.e. not from the tools the service was built
+to serve.
+
+The implementation is deliberately thin:
+
+- **A handle is not server state.** `ActionCreatePreparedStatement` returns an
+  encrypted, self-contained `(sql, claims)` payload — the same Fernet
+  construction as a `TicketStatementQuery` handle, tagged `kind: "prepared"`
+  so the two can't be redeemed in each other's role, and with a longer TTL
+  because a `PreparedStatement` object outlives a single
+  `GetFlightInfo`/`DoGet` pair. Nothing is allocated server-side, so nothing
+  leaks if a client never closes one, and any instance can serve any handle.
+- **Claims are captured at prepare time**, not re-read from the headers on the
+  later `CommandPreparedStatementQuery`. Same reasoning as the ticket design:
+  the statement was authorized once, and a later call must not be able to
+  re-scope it by presenting different or absent credentials.
+- **Preparing executes.** opteryx has no plan-only path yielding a result
+  schema (see "Query execution & streaming design"), and
+  `ActionCreatePreparedStatementResult.dataset_schema` must be populated for
+  drivers to build their `ResultSetMetaData`. The result is cached under the
+  handle, so the `GetFlightInfo` that follows is a cache hit rather than a
+  second execution. A syntax error therefore surfaces at `prepareStatement()`
+  time, which is where a JDBC user expects it.
+- **No bind parameters.** Every statement reports an empty parameter schema.
+  `DoPut` accepts and discards a parameter batch rather than failing, because
+  some drivers send an empty one as part of their execute path — but any rows
+  actually sent are logged and ignored, never silently treated as applied.
 
 ## Repo layout
 
@@ -318,6 +364,11 @@ swap only the image name.
 6. `visibility_filters` / policy enforcement parity check against
    `odata.opteryx` (same claims, same query, same dataset → same rows).
 
-Prepared statements, writes, and transactions are explicitly deferred past
-this list — v1 is done when a BI tool can connect, browse tables, and run a
-read-only SELECT.
+Writes and transactions are explicitly deferred past this list — v1 is done
+when a BI tool can connect, browse tables, and run a read-only SELECT.
+
+Prepared statements were originally deferred here too, and that turned out
+to be the wrong call: step 5 ("smoke-tested with a real JDBC driver") cannot
+pass without them, because JDBC drivers prepare statements to introspect.
+They are now implemented (see "Prepared statements" above), and step 5
+remains the open item.

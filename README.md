@@ -5,11 +5,19 @@ tools (BI tools, SQL IDEs, notebook drivers) can connect using the standard
 Arrow Flight SQL JDBC driver / ADBC ODBC driver instead of a bespoke client.
 Deployed as a Cloud Run service, sibling to `odata.opteryx`.
 
-This is a read-only service: `CommandStatementQuery` plus the metadata calls
-(`GetSqlInfo`, `GetCatalogs`, `GetDbSchemas`, `GetTables`, `GetTableTypes`) a
-JDBC/ODBC driver needs on connect. No writes, no prepared statements, no
-transactions in v1 — see [docs/design.md](docs/design.md) for the full
-rationale and non-goals.
+This is a read-only service: `CommandStatementQuery` and
+`CommandPreparedStatementQuery`, plus the metadata calls (`GetSqlInfo`,
+`GetCatalogs`, `GetDbSchemas`, `GetTables`, `GetTableTypes`) a JDBC/ODBC
+driver needs on connect. No writes, no bind parameters, no transactions —
+see [docs/design.md](docs/design.md) for the full rationale and non-goals.
+
+Prepared statements are supported because JDBC and ODBC clients route
+queries — and much of their introspection — through `PreparedStatement`
+rather than plain `Statement`, so a server without them is reachable from
+ADBC and hand-written clients but not, in practice, from DataGrip or
+DBeaver. Bind parameters remain out of scope: every statement reports an
+empty parameter schema and its SQL is executed as written, which is what
+those tools actually send.
 
 ## How it works
 
@@ -150,7 +158,16 @@ See [docs/design.md](docs/design.md#deployment) for the full rationale
 
 v1 scope per the design doc: `CommandStatementQuery`, `GetFlightInfo` +
 `DoGet`, auth middleware, and the metadata command surface are implemented
-and tested (including live against the deployed service). Not yet done:
-`CommandPreparedStatementQuery`, `DoPut`-based ingestion, transactions (all
-explicitly out of scope for v1), and a real JDBC/ADBC driver smoke test
-(only `pyarrow.flight.FlightClient` has exercised this server so far).
+and tested (including live against the deployed service).
+
+Prepared statements (`CreatePreparedStatement` / `ClosePreparedStatement` /
+`CommandPreparedStatementQuery`) were added after the deployed v1 was
+smoke-tested with a real ADBC client: queries, `GetCatalogs`, and
+`GetTables` all worked, but `adbc_prepare` failed with `must call Prepare
+before GetParameterSchema` — the gap that blocks every JDBC tool. They are
+covered by in-process round-trip tests but have **not** yet been exercised
+by a real JDBC driver against a deployed build; that remains the open
+verification step.
+
+Still out of scope: bind parameters, `DoPut`-based ingestion, and
+transactions.
