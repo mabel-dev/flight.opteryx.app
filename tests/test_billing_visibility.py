@@ -18,6 +18,7 @@ covers the grant and that nothing outside the namespace is granted.
 from fnmatch import fnmatchcase
 
 from app.auth.permissions import (
+    ACTOR_BREAKDOWN_RELATION,
     AUTHENTICATED_READ_RELATIONS,
     BILLING_NAMESPACE,
     DATA_ADMIN_ENTITLEMENT,
@@ -184,3 +185,34 @@ def test_unidentifiable_caller_yields_no_account():
     assert billing_account_from_claims({"sub": None}) is None
     assert billing_account_from_claims({"sub": "   "}) is None
     assert billing_account_from_claims({"billing_account": ["acme"]}) is None
+
+
+def test_the_actor_breakdown_is_not_granted_to_ordinary_callers():
+    """It names individuals and what they ran. Within a shared billing account
+    that is every colleague's activity, so it is gated rather than handed out
+    with the account's own billing."""
+    granted = [p["pattern"] for p in access_policies_for_query({"identity": "u", "policies": []})]
+    assert ACTOR_BREAKDOWN_RELATION not in granted
+    # ...while the workspace breakdown, which names no one, is.
+    assert "platform.billing.charges_daily_by_workspace" in granted
+
+
+def test_the_actor_breakdown_is_granted_to_data_admin():
+    claims = {"identity": "u", "policies": [], "entitlement": DATA_ADMIN_ENTITLEMENT}
+    granted = [p["pattern"] for p in access_policies_for_query(claims)]
+    assert ACTOR_BREAKDOWN_RELATION in granted
+
+
+def test_the_actor_breakdown_is_not_granted_to_anonymous_data_admin_claims():
+    """No identity means no grant at all, entitlement or not - the whole block
+    is behind the identity check."""
+    claims = {"policies": [], "entitlement": DATA_ADMIN_ENTITLEMENT}
+    assert access_policies_for_query(claims) == []
+
+
+def test_both_breakdowns_are_covered_by_the_row_level_filter():
+    """A granted relation outside the filtered namespace would be served
+    unfiltered - every account's rows, silently. This is the assertion that
+    catches a breakdown added to the grant but living outside platform.billing.*."""
+    for relation in list(AUTHENTICATED_READ_RELATIONS) + [ACTOR_BREAKDOWN_RELATION]:
+        assert fnmatchcase(relation, BILLING_NAMESPACE), relation

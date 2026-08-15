@@ -129,7 +129,30 @@ BILLING_NAMESPACE = "platform.billing.*"
 # the account-state and attribution snapshots, and the intermediate usage rollups.
 # None of those are a tenant's business; all of them stay behind an explicit reader
 # policy or the data_admin exemption, while remaining row-filtered regardless.
-AUTHENTICATED_READ_RELATIONS = ("platform.billing.charges_daily",)
+AUTHENTICATED_READ_RELATIONS = (
+    "platform.billing.charges_daily",
+    # The per-workspace breakdown behind the billing page's filter chips. Same
+    # rows as charges_daily, split by the workspace the usage happened in, with
+    # each workspace taking a share of the account's cost in proportion to its
+    # units. An allocation for reporting, not a charge — charges_daily remains
+    # the invoice.
+    "platform.billing.charges_daily_by_workspace",
+)
+
+# The same breakdown split by ACTOR — which identity ran the query — and NOT
+# granted to every authenticated caller. Within a shared billing account that
+# names individuals and their activity, so it is gated on `data_admin` rather
+# than handed out with the account's own billing.
+#
+# `data_admin` and not the member's `billing_role`: api-v2.md is explicit that
+# `billing_role` is ADVISORY ONLY ("deliberately *not* something a consumer
+# should enforce from the token alone"), because roles change inside a token's
+# lifetime and the authoritative check is a live re-read in billing.opteryx.
+# Deciding relation access from it would be exactly the enforcement that claim
+# says it is not for. Gating account owners properly needs either that claim
+# promoted to enforced, or a live membership lookup on the query path; neither
+# belongs in this change.
+ACTOR_BREAKDOWN_RELATION = "platform.billing.charges_daily_by_actor"
 
 
 def access_policies_for_query(claims: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -148,6 +171,11 @@ def access_policies_for_query(claims: Dict[str, Any]) -> List[Dict[str, str]]:
 
     if claims.get("identity"):
         policies.extend({"pattern": r, "role": "reader"} for r in AUTHENTICATED_READ_RELATIONS)
+        # The actor breakdown names individuals, so it is granted separately and
+        # only to data_admin. Added here rather than to the tuple above so an
+        # ordinary member of a shared billing account cannot read who ran what.
+        if DATA_ADMIN_ENTITLEMENT in entitlements_from_claims(claims):
+            policies.append({"pattern": ACTOR_BREAKDOWN_RELATION, "role": "reader"})
 
     return policies
 
