@@ -48,8 +48,8 @@ from opteryx_catalog import OpteryxCatalog
 
 from app.auth.permissions import access_policies_for_query
 from app.auth.permissions import visibility_filters_from_claims
-from app.config_client import get_config
-from app.logging import get_logger
+from opteryx_shared_services.config import get_config
+from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
 

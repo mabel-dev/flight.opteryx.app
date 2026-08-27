@@ -26,10 +26,10 @@ from google.auth.transport import requests as google_auth_requests
 from google.oauth2 import id_token as google_id_token
 from jose import JWTError
 from jose import jwt as jose_jwt
-from app.logging import get_logger
+from opteryx_shared_services.logging import get_logger
 
 from app.auth.errors import AuthError
-from app.config_client import get_config
+from opteryx_shared_services.config import get_config
 from app.secret_store import load_public_key
 
 

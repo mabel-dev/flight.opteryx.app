@@ -14,8 +14,8 @@ from __future__ import annotations
 import os
 
 from app.flight.server import OpteryxFlightServer
-from app.logging import get_logger
-from app.logging import set_log_name
+from opteryx_shared_services.logging import get_logger
+from opteryx_shared_services.logging import set_log_name
 
 set_log_name("opteryx.flight")
 logger = get_logger()

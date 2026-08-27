@@ -47,7 +47,7 @@ from app.flight import tickets
 from app.flight.auth_middleware import ClaimsMiddlewareFactory
 from app.flight.auth_middleware import claims_from_context
 from app.flight.proto import FlightSql_pb2 as fsql
-from app.logging import get_logger
+from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
 

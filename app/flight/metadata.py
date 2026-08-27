@@ -35,7 +35,7 @@ from app.auth.permissions import ANONYMOUS_EXEMPT_PAIRS
 from app.auth.permissions import ANONYMOUS_EXEMPT_WORKSTREAM
 from app.auth.permissions import get_access_policies_from_claims
 from app.core import _get_firestore_client
-from app.logging import get_logger
+from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
 

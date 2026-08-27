@@ -35,7 +35,7 @@ from cryptography.fernet import Fernet
 from cryptography.fernet import InvalidToken
 
 from app.flight.proto import FlightSql_pb2 as fsql
-from app.logging import get_logger
+from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
 

@@ -15,10 +15,10 @@ from typing import Dict
 import requests
 from jose import JWTError
 from jose import jwt as jose_jwt
-from app.logging import get_logger
+from opteryx_shared_services.logging import get_logger
 
 from app.auth.errors import AuthError
-from app.config_client import get_config
+from opteryx_shared_services.config import get_config
 
 logger = get_logger()
 

@@ -61,4 +61,8 @@ EXPOSE 8080
 # count to configure the way odata.opteryx's uvicorn entrypoint needs). Size
 # Cloud Run's --concurrency flag against that pool, not against a worker count
 # set here — see docs/design.md, "Cloud Run service config deltas".
-CMD ["python", "-m", "app.main"]
+# `app.preflight` runs FIRST and short-circuits the `&&`: it probes every
+# dependency and exits non-zero if one is unreachable, so Cloud Run fails the
+# revision and traffic stays on the one already serving. It cannot be only the
+# ASGI lifespan -- see app/preflight.py.
+CMD python -m app.preflight && exec python -m app.main
