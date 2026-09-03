@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover
 from opteryx_catalog import OpteryxCatalog
 
 from app.auth.permissions import access_policies_for_query
+from app.auth.permissions import entitlements_from_claims
 from app.auth.permissions import visibility_filters_from_claims
 from opteryx_shared_services.config import get_config
 from opteryx_shared_services.logging import get_logger
@@ -141,6 +142,11 @@ def session_for_claims(claims: Dict[str, Any]) -> "opteryx.query_session.Session
     return opteryx.session(
         user=identity,
         access_policies=access_policies,
+        # The caller's entitlement names, bare. The engine's permission capability
+        # resolves what they confer (e.g. `automation_admin::public` -> AUTOMATE on
+        # `public.*`); without them a caller entitled to run automation is refused
+        # here and allowed everywhere else.
+        entitlements=sorted(entitlements_from_claims(claims)),
         billing_account=billing_account,
     )
 
