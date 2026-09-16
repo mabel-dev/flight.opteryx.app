@@ -164,12 +164,16 @@ class OpteryxFlightServer(fl.FlightServerBase):
         endpoint = fl.FlightEndpoint(ticket=fl.Ticket(ticket_bytes), locations=[])
         return fl.FlightInfo(schema, descriptor, [endpoint], total_records=-1, total_bytes=-1)
 
-    def get_schema(self, context: fl.ServerCallContext, descriptor: fl.FlightDescriptor) -> pa.Schema:
+    def get_schema(self, context: fl.ServerCallContext, descriptor: fl.FlightDescriptor) -> fl.SchemaResult:
         # Same work as get_flight_info (opteryx has no plan-only path that
         # yields a result schema without executing -- see docs/design.md,
         # "Query execution & streaming design"), so this necessarily costs a
         # full GetFlightInfo-equivalent execution too.
-        return self.get_flight_info(context, descriptor).schema
+        #
+        # Must be a `SchemaResult`, not a bare `pa.Schema`: pyarrow's
+        # FlightServerBase raises ArrowTypeError ("must return a SchemaResult
+        # instance") on anything else, which made every GetSchema call fail.
+        return fl.SchemaResult(self.get_flight_info(context, descriptor).schema)
 
     def _prepare_statement_query(self, command: "fsql.CommandStatementQuery", claims: dict):
         sql = command.query

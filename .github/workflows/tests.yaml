@@ -1,0 +1,48 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # Exposed so another workflow can gate on this exact suite rather than
+  # re-declaring its own copy, which would be free to drift from the one that
+  # runs on PRs. Nothing calls it yet -- this service deploys by cloudbuild
+  # from a laptop, so CI here is a merge gate, not a deploy gate.
+  workflow_call:
+
+# A newer push to the same branch makes the in-flight run irrelevant.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  pytest:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't let one version failing hide the result on the others.
+      fail-fast: false
+      matrix:
+        # 3.14 only, and not opteryx-access's 3.11-3.14 matrix: this service
+        # declares `requires-python = ">=3.14"` in pyproject.toml (and pins
+        # 3.14.5 in .python-version). Testing 3.11 would test an interpreter
+        # the package refuses to install on.
+        python-version: ["3.14"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+
+    - name: deps
+      run: |
+        python -m pip install -U pip
+        python -m pip install -e ".[dev]"
+
+    - name: test
+      run: python -m pytest tests/ -v --durations=10

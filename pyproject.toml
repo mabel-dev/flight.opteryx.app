@@ -26,6 +26,14 @@ dependencies = [
     "requests==2.34.2",
 ]
 
+[project.optional-dependencies]
+# What CI installs to run tests/. Kept as an extra, matching opteryx-access,
+# so the test job's install is one command and cannot drift from what a
+# developer gets locally.
+dev = [
+    "pytest>=8",
+]
+
 [tool.isort]
 profile = "black"
 extend_skip_glob = ["tests/**"]
