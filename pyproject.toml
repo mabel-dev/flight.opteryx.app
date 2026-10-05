@@ -11,13 +11,13 @@ version = "0.0.2"
 description = "Opteryx Arrow Flight SQL Service"
 requires-python = '>=3.14'
 dependencies = [
-    "cryptography==50.0.1",
-    "google-cloud-firestore==2.33.0",
-    "google-cloud-secret-manager==2.30.0",
-    "google-cloud-storage==3.15.1",
+    "cryptography==50.0.2",
+    "google-cloud-firestore==2.34.0",
+    "google-cloud-secret-manager==2.31.0",
+    "google-cloud-storage==3.16.0",
     "opteryx-catalog[kms]>=0.4.141",
     "opteryx-shared-services[web,storage,secrets]>=0.2.2",
-    "opteryx-core>=0.9.146",
+    "opteryx-core>=0.9.155",
     "opteryx-access>=0.2.15",
     "opteryx-iceberg>=0.1.9",
     "protobuf>=7.36.2,<8",
