@@ -19,7 +19,7 @@ dependencies = [
     "opteryx-shared-services[web,storage,secrets]>=0.2.2",
     "opteryx-core>=0.9.181",
     "opteryx-access>=0.2.15",
-    "opteryx-iceberg>=0.1.19",
+    "opteryx-iceberg>=0.1.23",
     "protobuf>=7.36.2,<8",
     "pyarrow==26.0.0",
     "python-jose[cryptography]==3.5.0",
