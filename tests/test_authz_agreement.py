@@ -22,18 +22,13 @@ Sources, as of this change:
   * jobs.opteryx  `app/utils/claims.py`, `app/auth/deps.py`
 """
 
+import opteryx_access as access
 import pytest
 
 from app.auth import permissions
 from app.flight import metadata
 
 # --- transcribed sibling contract -------------------------------------------
-
-# odata.opteryx app/auth/permissions.py::ANONYMOUS_EXEMPT_PAIRS
-ODATA_ANONYMOUS_EXEMPT_PAIRS = {("public", "security"), ("public", "geopolitics")}
-
-# odata.opteryx app/auth/permissions.py::_READ_CAPABLE_ROLES
-ODATA_READ_CAPABLE_ROLES = {"reader", "writer", "admin", "owner"}
 
 # odata.opteryx app/auth/permissions.py -- module constants
 ODATA_DATA_ADMIN_ENTITLEMENT = "data_admin"
@@ -49,11 +44,14 @@ ODATA_ACTOR_BREAKDOWN_RELATION = "platform.billing.charges_daily_by_actor"
 # --- the constants themselves -----------------------------------------------
 
 
-def test_anonymous_surface_matches_odata():
-    # The full set of (workstream, collection) pairs reachable with no
-    # credentials. If this service ever exposed a pair odata.opteryx does
-    # not, Flight would be the soft underbelly of the fleet.
-    assert permissions.ANONYMOUS_EXEMPT_PAIRS == ODATA_ANONYMOUS_EXEMPT_PAIRS
+def test_no_local_anonymous_allowlist_survives():
+    # Which workspaces an unidentified caller may read is opteryx-access's
+    # decision (`implicit_access` / `can_perform_action` with identity=None).
+    # The transcribed copy that used to live here is what drifted between
+    # services; it must not quietly come back.
+    for name in ("ANONYMOUS_EXEMPT_PAIRS", "ANONYMOUS_EXEMPT_WORKSTREAM", "is_anonymous_exempt"):
+        assert not hasattr(permissions, name), name
+    assert not hasattr(metadata, "_role_allows_read")
 
 
 def test_billing_constants_match_odata():
@@ -64,17 +62,14 @@ def test_billing_constants_match_odata():
     assert permissions.ACTOR_BREAKDOWN_RELATION == ODATA_ACTOR_BREAKDOWN_RELATION
 
 
-def test_read_capable_roles_match_odata():
-    # This service keeps its own private copy of the role set
-    # (`metadata._role_allows_read`) rather than importing odata's
-    # `role_allows_read`, so the two can drift silently. Pin both directions:
-    # every role odata reads with must read here, and no other role may.
-    for role in ODATA_READ_CAPABLE_ROLES:
-        assert metadata._role_allows_read(role), role
-        assert metadata._role_allows_read(role.upper()), role  # comparison is casefolded
-
-    for role in ("viewer", "auditor", "none", "", None):
-        assert not metadata._role_allows_read(role), role
+def test_read_capable_roles_are_the_librarys():
+    # Which roles confer READ is opteryx-access's table, not a private copy
+    # here. Every role the library reads with makes a granted row visible; a
+    # role it does not know makes none visible, whatever its spelling.
+    for role in ("reader", "writer", "owner"):
+        assert access.action_allowed_for_role(role, "READ"), role
+    for role in ("viewer", "auditor", "none", "admin", "READER"):
+        assert not access.action_allowed_for_role(role, "READ"), role
 
 
 # --- entitlement parsing ----------------------------------------------------
@@ -183,6 +178,8 @@ ALL_ROWS = [
     metadata.DatasetRow("globex", "sales", "orders", "TABLE"),
     metadata.DatasetRow("personal", "alice@example.com", "scratch", "TABLE"),
     metadata.DatasetRow("personal", "bob@example.com", "bobs_notes", "TABLE"),
+    metadata.DatasetRow("samples", "tpch_sf1", "lineitem", "TABLE"),
+    metadata.DatasetRow("demo", "planets", "moons", "TABLE"),
 ]
 
 
@@ -220,25 +217,31 @@ def _visible(claims):
     }
 
 
-def test_anonymous_caller_sees_only_the_exempt_pairs(catalog):
-    # Agreement with odata.opteryx's service document: an unidentified caller
-    # sees the exempt pairs and nothing else -- notably NOT the rest of the
-    # `public` workspace, which is visible to authenticated callers.
-    assert _visible({}) == {
-        ("public", "geopolitics", "countries"),
-        ("public", "security", "incidents"),
+def test_anonymous_caller_sees_only_what_the_library_lets_it_read(catalog):
+    # Flight requires a bearer token, but one with no subject still arrives
+    # with no identity. What such a caller sees is opteryx-access's decision:
+    # in `public`, only the collections it lets an unidentified session read,
+    # never the rest of the workspace (which needs a signed-in identity).
+    expected = {
+        (catalog_name, schema, table)
+        for catalog_name, schema, table in {
+            ("public", "geopolitics", "countries"),
+            ("public", "security", "incidents"),
+            ("public", "internal_only", "secrets"),
+        }
+        if access.can_perform_action([], f"{catalog_name}.{schema}.{table}", "READ")
     }
+    assert _visible({}) == expected
+    assert ("public", "internal_only", "secrets") not in _visible({})
 
 
 def test_anonymous_caller_cannot_widen_itself_with_policies(catalog):
     # Policies on a token with no identity must buy nothing. Otherwise a
-    # token that merely failed to carry a `sub` would be a way around the
-    # anonymous surface.
+    # token that merely failed to carry a `sub` would be a way of holding
+    # somebody's grants.
     claims = {"policies": [{"role": "owner", "pattern": "acme.*"}]}
-    assert _visible(claims) == {
-        ("public", "geopolitics", "countries"),
-        ("public", "security", "incidents"),
-    }
+    assert _visible(claims) == _visible({})
+    assert not any(catalog_name == "acme" for catalog_name, _, _ in _visible(claims))
 
 
 def test_identity_reaches_its_own_personal_workspace(catalog):
@@ -272,33 +275,48 @@ def test_a_non_read_capable_role_grants_no_visibility(catalog):
 
 
 def test_authenticated_callers_see_the_whole_public_workspace(catalog):
-    # Wider than the anonymous surface, and intentionally so: `public` is
-    # readable by anyone who is somebody. Pinned because the difference
-    # between the two surfaces is easy to collapse by accident.
+    # Wider than the anonymous surface, and intentionally so: the library
+    # makes `public` readable by every signed-in identity. Pinned because the
+    # difference between the two surfaces is easy to collapse by accident.
     claims = {"identity": "u@example.com", "policies": []}
     assert ("public", "internal_only", "secrets") in _visible(claims)
 
 
-def test_KNOWN_DIVERGENCE_a_relation_grant_is_widened_to_its_whole_workspace(catalog):
-    """A grant on ONE relation makes every relation beside it visible here.
+def test_samples_and_demo_are_readable_but_not_listed(catalog):
+    # Both are readable by a signed-in identity through implicit grants, but
+    # deliberately unlisted: implicit grants never appear in the policies
+    # claim, and the catalog lists `public` alone by name. Anyone can still
+    # query them -- they are just not in the tree.
+    assert access.can_perform_action([], "samples.tpch_sf1.lineitem", "READ", identity="u")
+    assert access.can_perform_action([], "demo.planets.moons", "READ", identity="u")
+    visible = _visible({"identity": "u@example.com", "policies": []})
+    assert not any(catalog_name in {"samples", "demo"} for catalog_name, _, _ in visible)
+    assert not any(catalog_name in {"samples", "demo"} for catalog_name, _, _ in _visible({}))
 
-    This is a characterization test, not an endorsement. `list_visible_datasets`
-    maps a policy to a workspace with `pattern.split(".")[0]` and then decides
-    visibility per workspace, so `reader on acme.sales.orders` discloses
-    `acme.hr.salaries` too.
 
-    odata.opteryx answers the same question with `read_grant_for_relation`,
-    which fnmatches the policy pattern against the FULL relation name, and its
-    docstring names this exact failure: "Matching on anything less (e.g.
-    collapsing the pattern to its workstream) would let a grant on one relation
-    disclose every relation beside it."
+def test_an_issued_policy_cannot_reach_a_reserved_workspace(catalog):
+    # The library caps reserved workspaces at their implicit grants: a stored
+    # policy over `samples` (which `validate_pattern` would refuse to issue
+    # today) still confers nothing beyond what the implicit reader grant does.
+    claims = {"identity": "u@example.com", "policies": [{"role": "owner", "pattern": "samples.*"}]}
+    # the policy names `samples`, so the listing looks there -- and lists it,
+    # because the library says a signed-in identity may read it
+    assert ("samples", "tpch_sf1", "lineitem") in _visible(claims)
+    assert not access.can_perform_action(
+        access.parse_policy_claim(claims), "samples.tpch_sf1.lineitem", "DELETE", identity="u"
+    )
 
-    So the two services disagree, and this service is the permissive one. The
-    assertion below records what it does TODAY so the divergence is visible in
-    the suite rather than latent. Closing it means giving this service the
-    equivalent of `read_grant_for_relation`, which changes what GetTables
-    returns and is deliberately out of scope for a CI-enablement change --
-    it is reported as a finding instead.
+
+def test_a_relation_grant_discloses_only_that_relation(catalog):
+    """A grant on ONE relation makes only that relation visible.
+
+    This used to be a KNOWN DIVERGENCE: visibility was decided per workspace
+    after collapsing each policy to `pattern.split(".")[0]`, so `reader on
+    acme.sales.orders` disclosed `acme.hr.salaries` too, where odata.opteryx
+    (and the query engine) matched the full relation name. Every row is now
+    put to `opteryx_access.can_perform_action`, which matches the full name,
+    so the two services agree and the listing no longer names a relation the
+    caller cannot read.
     """
     claims = {
         "identity": "u@example.com",
@@ -306,9 +324,16 @@ def test_KNOWN_DIVERGENCE_a_relation_grant_is_widened_to_its_whole_workspace(cat
     }
     visible = _visible(claims)
 
-    assert ("acme", "sales", "orders") in visible  # granted, and correct
-    assert ("acme", "hr", "salaries") in visible  # NOT granted -- the divergence
-
-    # The part that is at least not broken: the widening stops at the
-    # workspace boundary and does not reach a workspace nothing was granted in.
+    assert ("acme", "sales", "orders") in visible
+    assert ("acme", "hr", "salaries") not in visible
     assert ("globex", "sales", "orders") not in visible
+
+
+def test_triple_shaped_policies_still_grant_visibility(catalog):
+    # The issuer's `[id, role, pattern]` triple is a shape the library's own
+    # claim parser skips; `grants_from_claims` converts it first, so it must
+    # still reach the library as a grant.
+    claims = {"identity": "u@example.com", "policies": [["p1", "reader", "acme.hr.*"]]}
+    visible = _visible(claims)
+    assert ("acme", "hr", "salaries") in visible
+    assert ("acme", "sales", "orders") not in visible

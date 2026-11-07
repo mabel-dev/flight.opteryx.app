@@ -9,26 +9,20 @@ from typing import Dict
 from typing import List
 from typing import Optional
 
+from opteryx_access import Grant
+from opteryx_access import parse_policy_claim
 from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
 
-# The workstream.collection pairs reachable with zero credentials (see
-# app.auth.deps.require_authentication, which lets anonymous requests through
-# rather than rejecting them). Every endpoint that accepts anonymous callers
-# must still scope them down to exactly these pairs itself. Only add a pair
-# here for datasets that are intentionally public (e.g. open data backing
-# public-facing dashboards) — this is the full anonymous-access surface.
-ANONYMOUS_EXEMPT_WORKSTREAM = "public"
-ANONYMOUS_EXEMPT_PAIRS = {
-    ("public", "security"),
-    ("public", "geopolitics"),
-}
-
-
-def is_anonymous_exempt(workstream: Optional[str], collection: Optional[str]) -> bool:
-    """Whether (workstream, collection) is reachable without authentication."""
-    return (workstream, collection) in ANONYMOUS_EXEMPT_PAIRS
+# There is no anonymous allowlist in this module, and there must not be one
+# again. One used to live here (ANONYMOUS_EXEMPT_PAIRS, transcribed from
+# odata.opteryx), but this service requires a bearer token on every call (see
+# app.auth.deps), so it was dead code -- and which workspaces an unidentified
+# caller may read is an access decision, which belongs to opteryx-access
+# (`can_perform_action` / `implicit_access` with `identity=None`), not to a
+# per-service copy that drifts from it. See `grants_from_claims` below and
+# `app.flight.metadata.list_visible_datasets`.
 
 
 # Entitlement that lifts row-level filtering entirely. Holders see every account's rows.
@@ -287,3 +281,17 @@ def get_access_policies_from_claims(claims: Dict[str, Any]) -> List[Dict[str, st
     """
     policies = claims.get("policies", [])
     return convert_policies_for_opteryx(policies)
+
+
+def grants_from_claims(claims: Dict[str, Any]) -> List[Grant]:
+    """The caller's issued policies as opteryx-access `Grant`s.
+
+    Converted through `get_access_policies_from_claims` first and only then
+    parsed by the library, because the token's `policies` claim arrives in a
+    shape the library's own parser skips (the `[id, role, pattern]` triple);
+    the converter already handles every shape this service has seen, and its
+    dict output is one the library accepts. What comes out is exactly what
+    `opteryx_access.can_perform_action` decides from -- this function makes no
+    decision of its own about what any grant is worth.
+    """
+    return parse_policy_claim({"policies": get_access_policies_from_claims(claims)})

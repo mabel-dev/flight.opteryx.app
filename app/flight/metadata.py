@@ -5,9 +5,9 @@ Catalog/schema/table enumeration mirrors odata.opteryx's
 collection -> db_schema_name, dataset/view name -> table_name, backed by the
 same Firestore collection-group query pattern (cheap at scale -- one round
 trip per workspace regardless of how many collections it has) rather than
-`OpteryxCatalog.list_collections()`/`list_datasets()` per workspace, and the
-same access-control rules (personal workspace, public workspace, JWT
-`policies` claim). Statistics/sort-order annotations that OData's
+`OpteryxCatalog.list_collections()`/`list_datasets()` per workspace. Which
+rows a caller may see is NOT decided here: every row is put to
+`opteryx_access.can_perform_action` (see `list_visible_datasets`). Statistics/sort-order annotations that OData's
 `$metadata` endpoint adds aren't relevant to Flight SQL's fixed schemas, so
 they're left out here.
 
@@ -30,14 +30,26 @@ from typing import Sequence
 
 import pyarrow as pa
 from google.cloud.firestore_v1.base_query import FieldFilter
+from opteryx_access import can_perform_action
 
-from app.auth.permissions import ANONYMOUS_EXEMPT_PAIRS
-from app.auth.permissions import ANONYMOUS_EXEMPT_WORKSTREAM
-from app.auth.permissions import get_access_policies_from_claims
+from app.auth.permissions import grants_from_claims
 from app.core import _get_firestore_client
 from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
+
+# Workspaces the catalog lists BY NAME, on top of the caller's own personal
+# namespace and every workspace their `policies` claim names. A listing choice,
+# not an access decision: whether any row found in one is visible is still put
+# to the library row by row, so an anonymous caller listing `public` sees only
+# what opteryx-access lets it read there.
+#
+# `public` only. `samples` and `demo` are readable through implicit grants too
+# (see `opteryx_access.implicitly_readable_workspaces`), but they are
+# deliberately UNLISTED -- implicit grants never appear in the policies claim,
+# and odata.opteryx's service document, which this catalog mirrors, unions in
+# `public` alone. Anyone can still query them; they just are not in the tree.
+LISTED_BY_NAME = ("public",)
 
 TABLE_TYPES = ("TABLE", "VIEW")
 
@@ -108,64 +120,70 @@ def _workspace_datasets(db, workspace_ids: Iterable[str]) -> List[DatasetRow]:
     return results
 
 
-def _role_allows_read(role: Optional[str]) -> bool:
-    return bool(role) and role.lower() in {"reader", "writer", "admin", "owner"}
+def _workspace_of(pattern: str) -> str:
+    """The workspace a policy pattern names: everything before its first dot.
+
+    Used only to decide WHERE to look for rows, never whether a row is
+    visible -- a pattern over one collection still sends the listing to the
+    whole workspace, and the library then refuses every row the pattern does
+    not cover.
+    """
+    return pattern.split(".", 1)[0]
 
 
 def list_visible_datasets(claims: Dict[str, Any]) -> List[DatasetRow]:
     """Every (catalog, db_schema, table) the caller may read.
 
-    Same access-control shape as odata.opteryx's `get_service_document`:
-    anonymous callers see only `ANONYMOUS_EXEMPT_PAIRS`; authenticated
-    callers see their own `personal.<identity>` workspace, `public.*`
-    read-only, and any workspace named by a read-capable policy pattern in
-    their JWT `policies` claim.
+    Two separate steps, and only the first is this service's:
+
+    1. WHERE TO LOOK -- the caller's own `personal.<identity>` namespace,
+       every workspace their `policies` claim names, and `LISTED_BY_NAME`.
+       This shapes the catalog (it is why `samples` and `demo` are absent
+       from it) but grants nothing.
+    2. WHAT IS VISIBLE -- each row found is put to
+       `opteryx_access.can_perform_action(..., "READ", identity=...)` with the
+       caller's issued grants, so the decision is the library's, including
+       its implicit grants (owner of your own personal namespace, nobody
+       else's; `public` read-only for a signed-in identity) and the cap that
+       stops an issued policy reaching a reserved workspace. Per ROW rather
+       than per workspace: a grant on one relation does not disclose the
+       relations beside it, exactly as the query engine (which asks the same
+       library) would refuse to read them.
+
+    Every Flight call needs a bearer token, but a verified token with no
+    `sub`/`email`/`preferred_username` still reaches here with no identity
+    (see `app.auth.deps._normalize_claims`). It is answered the same way,
+    with `identity=None`: the library
+    decides what an anonymous session may read. Its issued policies are not
+    consulted -- a token that names nobody must not be a way of holding
+    somebody's grants -- so it is left with whatever the library grants
+    everyone.
     """
     db = _get_firestore_client(database="catalogs")
     if db is None:
         logger.error("Firestore client unavailable; returning no catalog metadata")
         return []
 
-    identity = claims.get("identity")
+    identity = claims.get("identity") or None
+    grants = grants_from_claims(claims) if identity else []
 
-    if identity is None:
-        all_rows = _workspace_datasets(db, {ANONYMOUS_EXEMPT_WORKSTREAM})
-        return [
-            row
-            for row in all_rows
-            if (row.catalog_name, row.db_schema_name) in ANONYMOUS_EXEMPT_PAIRS
-        ]
-
-    access_policies_list = get_access_policies_from_claims(claims)
-    workspace_roles: Dict[str, List[str]] = {}
-    for p in access_policies_list:
-        role = p.get("role")
-        pattern = p.get("pattern")
-        if not role or not pattern:
-            continue
-        workspace = pattern.split(".")[0] if "." in pattern else pattern
-        workspace_roles.setdefault(workspace, []).append(role)
-
-    workspace_ids = set(workspace_roles.keys()) | {"public"}
+    workspace_ids = {_workspace_of(grant.pattern) for grant in grants} | set(LISTED_BY_NAME)
 
     all_rows: List[DatasetRow] = []
-    all_rows.extend(_personal_datasets(db, identity))
+    if identity:
+        all_rows.extend(_personal_datasets(db, identity))
     all_rows.extend(_workspace_datasets(db, workspace_ids))
 
-    visible: List[DatasetRow] = []
-    for row in all_rows:
-        if row.catalog_name == "personal":
-            if row.db_schema_name == identity:
-                visible.append(row)
-            continue  # someone else's personal workspace: never visible
-        if row.catalog_name == "public":
-            visible.append(row)
-            continue
-        roles = workspace_roles.get(row.catalog_name, [])
-        if any(_role_allows_read(role) for role in roles):
-            visible.append(row)
-
-    return visible
+    return [
+        row
+        for row in all_rows
+        if can_perform_action(
+            grants,
+            f"{row.catalog_name}.{row.db_schema_name}.{row.table_name}",
+            "READ",
+            identity=identity,
+        )
+    ]
 
 
 def _like_to_fnmatch(pattern: Optional[str]) -> Optional[str]:
