@@ -7,7 +7,7 @@
 FROM python:3.14-slim AS mimalloc
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake curl ca-certificates \
-    && curl -sL https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz | tar xz \
+    && curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz | tar xz \
     && cmake -S mimalloc-3.3.2 -B /mi -DCMAKE_BUILD_TYPE=Release \
         -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF \
     && cmake --build /mi -j
