@@ -28,12 +28,12 @@ Flight SQL's request shape is always two calls:
 2. **`DoGet`** — redeem that ticket to stream the actual Arrow data.
 
 This server implements that dispatch by hand rather than subclassing a
-high-level Flight SQL base class: the pinned PyArrow build (25.0.0) doesn't
+high-level Flight SQL base class: PyArrow's Python bindings don't
 expose one (`pyarrow.flight` has no `*Sql*`-named class), and doesn't bundle
 the Flight SQL protobuf definitions either. Those are vendored at
 [app/flight/proto/FlightSql_pb2.py](app/flight/proto/FlightSql_pb2.py),
-compiled from the upstream `format/FlightSql.proto` and stamped for the
-protobuf runtime version this project (and `odata.opteryx`) actually installs.
+compiled from the upstream Apache Arrow `format/FlightSql.proto`
+(Apache-2.0).
 `app/flight/server.py` unpacks each `FlightDescriptor.command` as a
 `google.protobuf.Any` and dispatches on the unpacked type.
 
@@ -42,10 +42,11 @@ protobuf runtime version this project (and `odata.opteryx`) actually installs.
 ```
 app/
   main.py                    # process entrypoint -- starts the Flight gRPC server directly
-  logging.py, core.py, secret_store.py   # copied from odata.opteryx, unchanged
+  preflight.py               # dependency checks run before the server starts
+  core.py                    # Firestore client helper
+  secret_store.py            # read-only JWT public key lookup (GCP Secret Manager)
   auth/
-    deps.py                    # bearer-JWT verification (ported from odata.opteryx)
-    external_auth.py             # basic-auth -> JWT exchange (ported)
+    deps.py                    # bearer-JWT verification (ported from odata.opteryx, hardened)
     permissions.py                 # JWT claims -> Opteryx access_policies/visibility_filters (unchanged)
     errors.py                        # transport-agnostic AuthError, mapped to Flight errors at the edge
   flight/
@@ -134,7 +135,8 @@ against a live deployment.
 |---|---|---|
 | `PORT` | Port to bind the Flight gRPC server on | `8080` |
 | `FLIGHT_TICKET_KEY` | `Fernet` key (32 url-safe base64 bytes) encrypting tickets. Generate with `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Required for stable behavior across restarts/multiple instances; a random one is generated per-process if unset | unset (ephemeral) |
-| `FLIGHT_TICKET_TTL_SECONDS` | How long a ticket is redeemable after `GetFlightInfo` | `300` |
+| `FLIGHT_TICKET_TTL_SECONDS` | How long a ticket is redeemable after `GetFlightInfo` (never past the caller's token `exp`) | `300` |
+| `FLIGHT_PREPARED_TTL_SECONDS` | How long a prepared statement handle stays executable (never past the caller's token `exp`) | `3600` |
 | `FLIGHT_RESULT_CACHE_TTL_SECONDS` / `FLIGHT_RESULT_CACHE_MAX_ENTRIES` | Bounds on the in-process result cache bridging `GetFlightInfo` -> `DoGet` | `300` / `128` |
 | `GCP_PROJECT_ID`, `FIRESTORE_DATABASE`, `GCS_BUCKET` | Opteryx catalog backing store — same vars `odata.opteryx` uses | unset |
 | `AUTH_URL`, `JWT_ISSUER`, `DATA_AUDIENCE` | Bearer-token verification — same vars `odata.opteryx` uses | `https://authenticate.opteryx.app` / same / `opteryx` |

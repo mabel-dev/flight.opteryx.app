@@ -11,6 +11,10 @@ on:
   # from a laptop, so CI here is a merge gate, not a deploy gate.
   workflow_call:
 
+# Tests only need to read the code; nothing here writes back to the repo.
+permissions:
+  contents: read
+
 # A newer push to the same branch makes the in-flight run irrelevant.
 concurrency:
   group: tests-${{ github.ref }}

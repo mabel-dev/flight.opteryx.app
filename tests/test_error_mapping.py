@@ -65,6 +65,14 @@ def test_the_original_message_always_survives():
         assert str(exc) in str(_map_opteryx_exception(exc))
 
 
+def test_non_opteryx_errors_do_not_leak_their_message():
+    # A non-opteryx exception is an internal failure, and its text can name
+    # buckets, paths or service URLs. The client gets a generic message.
+    mapped = _map_opteryx_exception(RuntimeError("gs://internal-bucket/secret/path"))
+    assert isinstance(mapped, fl.FlightServerError)
+    assert "internal-bucket" not in str(mapped)
+
+
 def test_read_only_refusals_are_not_reported_as_permission_errors():
     # `ReadOnlyConnectorError` is a DatabaseError, not a PermissionsError, so
     # it falls through to FlightServerError. Pinned deliberately: a client

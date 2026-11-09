@@ -10,7 +10,9 @@ rather than decoding to attacker-controlled data.
 
 Tickets also carry a short TTL (`Fernet.decrypt(..., ttl=...)`), since a
 ticket is only ever meant to bridge one `GetFlightInfo` -> `DoGet` pair, not
-to be replayed later or cached by the client.
+to be replayed later or cached by the client. Every handle additionally
+records its token's `exp` and is refused after it, and `app.flight.server`
+only honours a handle for the identity it was issued to.
 
 The key is per-process. Cloud Run instances are ephemeral and stateless
 between deploys/scale events, and a ticket's whole lifetime is "issued and
@@ -27,6 +29,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from typing import Any
 from typing import Dict
 from typing import Tuple
@@ -65,13 +68,34 @@ def _ttl_seconds() -> int:
     return int(os.environ.get("FLIGHT_TICKET_TTL_SECONDS", DEFAULT_TICKET_TTL_SECONDS))
 
 
+# A handle carries the claims it was minted under, so it must not outlive the
+# token those claims came from: a handle minted a minute before the token
+# expired would otherwise keep executing under it for the handle's whole TTL.
+def _not_after(claims: Dict[str, Any]) -> Any:
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    return exp if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
+
+
+def _decrypt(handle: bytes, ttl: int) -> Dict[str, Any]:
+    payload = _FERNET.decrypt(handle, ttl=ttl)
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise TypeError("ticket payload is not an object")
+    not_after = data.get("not_after")
+    if not_after is not None and time.time() >= not_after:
+        raise InvalidTicket("Ticket has outlived the token it was issued under")
+    return data
+
+
 def encode_statement_handle(sql: str, claims: Dict[str, Any]) -> bytes:
     """Mint an opaque handle carrying `(sql, claims)`.
 
     The returned bytes are meant to be embedded verbatim as the
     `statement_handle` of a `TicketStatementQuery` (see `app.flight.server`).
     """
-    payload = json.dumps({"sql": sql, "claims": claims}, separators=(",", ":")).encode("utf-8")
+    payload = json.dumps(
+        {"sql": sql, "claims": claims, "not_after": _not_after(claims)}, separators=(",", ":")
+    ).encode("utf-8")
     return _FERNET.encrypt(payload)
 
 
@@ -82,8 +106,7 @@ def decode_statement_handle(handle: bytes) -> Tuple[str, Dict[str, Any]]:
     has outlived `FLIGHT_TICKET_TTL_SECONDS`.
     """
     try:
-        payload = _FERNET.decrypt(handle, ttl=_ttl_seconds())
-        data = json.loads(payload)
+        data = _decrypt(handle, _ttl_seconds())
         return data["sql"], data["claims"]
     except InvalidToken as exc:
         raise InvalidTicket("Ticket is invalid, tampered with, or expired") from exc
@@ -119,7 +142,8 @@ def encode_prepared_handle(sql: str, claims: Dict[str, Any]) -> bytes:
     execute the statement under different (or absent) claims.
     """
     payload = json.dumps(
-        {"kind": "prepared", "sql": sql, "claims": claims}, separators=(",", ":")
+        {"kind": "prepared", "sql": sql, "claims": claims, "not_after": _not_after(claims)},
+        separators=(",", ":"),
     ).encode("utf-8")
     return _FERNET.encrypt(payload)
 
@@ -131,8 +155,7 @@ def decode_prepared_handle(handle: bytes) -> Tuple[str, Dict[str, Any]]:
     or is a statement/metadata ticket rather than a prepared statement handle.
     """
     try:
-        payload = _FERNET.decrypt(handle, ttl=_prepared_ttl_seconds())
-        data = json.loads(payload)
+        data = _decrypt(handle, _prepared_ttl_seconds())
         if data.get("kind") != "prepared":
             raise InvalidTicket("Handle is not a prepared statement handle")
         return data["sql"], data["claims"]
@@ -170,6 +193,7 @@ def encode_metadata_ticket(command: Any, claims: Dict[str, Any]) -> bytes:
             "command_type": command_type,
             "command_bytes": base64.b64encode(command.SerializeToString()).decode("ascii"),
             "claims": claims,
+            "not_after": _not_after(claims),
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -178,8 +202,7 @@ def encode_metadata_ticket(command: Any, claims: Dict[str, Any]) -> bytes:
 
 def decode_metadata_ticket(handle: bytes) -> Tuple[Any, Dict[str, Any]]:
     try:
-        payload = _FERNET.decrypt(handle, ttl=_ttl_seconds())
-        data = json.loads(payload)
+        data = _decrypt(handle, _ttl_seconds())
         command_cls = _METADATA_COMMAND_TYPES_BY_NAME[data["command_type"]]
         command = command_cls()
         command.ParseFromString(base64.b64decode(data["command_bytes"]))

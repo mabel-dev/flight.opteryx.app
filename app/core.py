@@ -1,11 +1,4 @@
-"""
-Core helpers used across the app (logger and shared helper functions).
-
-This module provides the minimal surface area needed by the service after
-being moved from another repo. It intentionally avoids external runtime
-dependencies (other than `logging`) and exposes an `_get_firestore_client`
-helper used by both the adapter and routes modules.
-"""
+"""Shared Firestore client helper, used by the metadata handlers."""
 
 from __future__ import annotations
 
@@ -13,23 +6,7 @@ import os
 from functools import lru_cache
 from typing import Optional
 
-import requests
 from google.cloud import firestore
-
-
-@lru_cache(maxsize=1)
-def _runtime_service_account() -> Optional[str]:
-    try:
-        r = requests.get(
-            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
-            headers={"Metadata-Flavor": "Google"},
-            timeout=0.2,
-        )
-        if r.status_code == 200:
-            return r.text.strip()
-    except Exception:
-        return None
-    return None
 
 
 @lru_cache(maxsize=1)
