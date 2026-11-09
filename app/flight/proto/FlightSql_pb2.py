@@ -3,6 +3,10 @@
 # NO CHECKED-IN PROTOBUF GENCODE
 # source: FlightSql.proto
 # Protobuf Python Version: 6.31.1
+#
+# Generated from FlightSql.proto in Apache Arrow (https://github.com/apache/arrow,
+# format/FlightSql.proto), Copyright The Apache Software Foundation, licensed
+# under the Apache License, Version 2.0. See the LICENSE file in this repository.
 """Generated protocol buffer code."""
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool

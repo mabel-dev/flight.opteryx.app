@@ -1,9 +1,9 @@
 """Flight SQL command dispatch.
 
 **Why this hand-dispatches instead of subclassing a high-level Flight SQL
-server base** (the design's "First implementation task"): the pinned
-PyArrow build (25.0.0) was inspected directly (`dir(pyarrow.flight)`) and
-exposes only base Flight primitives (`FlightServerBase`, `FlightDescriptor`,
+server base** (the design's "First implementation task"): PyArrow's Python
+bindings (inspected directly via `dir(pyarrow.flight)`) expose only base
+Flight primitives (`FlightServerBase`, `FlightDescriptor`,
 `FlightInfo`, `FlightEndpoint`, `Ticket`, `GeneratorStream`,
 `RecordBatchStream`, `ServerMiddleware(Factory)`, ...) — no class or method
 with `Sql` in its name anywhere in the module. There is no high-level Flight
@@ -13,10 +13,7 @@ SQL server base to subclass in this environment. This is option 2 from
 which PyArrow does *not* bundle either (no `flight_sql*` files anywhere
 under the installed `pyarrow` package) — they're vendored at
 `app/flight/proto/FlightSql_pb2.py`, compiled from the upstream
-`format/FlightSql.proto` and stamped for the protobuf runtime version this
-project actually installs (protobuf 6.x, matching odata.opteryx's pin, so
-the two services can keep sharing a Firestore/GCS dependency stack without
-a protobuf version conflict).
+`format/FlightSql.proto`.
 
 **Ticket design**: `GetFlightInfo` executes eagerly (see
 `app.flight.query.ResultCache`) and mints a ticket carrying an encrypted
@@ -28,8 +25,10 @@ re-computed on a cache miss) under the claims that were live when
 `GetFlightInfo` ran, and using different, possibly-anonymous claims at
 `DoGet` time would silently hand a caller data that was authorized for
 someone else. Every call (including `DoGet`) still goes through
-`ClaimsMiddlewareFactory`, but only to gate that the call is
-structurally valid — same anonymous-tolerant policy as odata.opteryx.
+`ClaimsMiddlewareFactory`, which requires a valid bearer token, and a ticket
+or prepared statement handle is only honoured for the same identity it was
+issued to (`_require_ticket_owner`): a handle is not a bearer credential that
+any other authenticated caller can redeem.
 """
 
 from __future__ import annotations
@@ -138,7 +137,25 @@ def _map_opteryx_exception(exc: Exception) -> fl.FlightError:
     """
     if isinstance(exc, opteryx_exceptions.PermissionsError):
         return fl.FlightUnauthorizedError(str(exc))
-    return fl.FlightServerError(str(exc))
+    if isinstance(exc, opteryx_exceptions.Error):
+        return fl.FlightServerError(str(exc))
+    # Anything that is not one of opteryx's own, user-facing errors (a cloud
+    # client error, a KeyError deep in a connector, ...) can carry internal
+    # detail -- bucket names, paths, service URLs -- so the client gets a
+    # generic message and the detail stays in the server log.
+    logger.error(f"Unexpected {type(exc).__name__} while executing query: {exc}")
+    return fl.FlightServerError("Internal error while executing the query")
+
+
+def _require_ticket_owner(context: fl.ServerCallContext, ticket_claims: dict) -> None:
+    """Refuse a ticket/handle presented by anyone but the identity it was issued to.
+
+    The handle's own claims are still what the query runs under; this only
+    checks that the caller presenting it is the one it was minted for.
+    """
+    caller = claims_from_context(context)
+    if caller.get("identity") != ticket_claims.get("identity"):
+        raise fl.FlightUnauthorizedError("Ticket was issued to a different caller")
 
 
 class OpteryxFlightServer(fl.FlightServerBase):
@@ -157,7 +174,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
         if isinstance(command, fsql.CommandStatementQuery):
             schema, ticket_bytes = self._prepare_statement_query(command, claims)
         elif isinstance(command, fsql.CommandPreparedStatementQuery):
-            schema, ticket_bytes = self._prepare_prepared_statement_query(command)
+            schema, ticket_bytes = self._prepare_prepared_statement_query(context, command)
         else:
             schema, ticket_bytes = self._prepare_metadata_command(command, claims)
 
@@ -193,7 +210,9 @@ class OpteryxFlightServer(fl.FlightServerBase):
         any_msg.Pack(ticket_msg)
         return schema, any_msg.SerializeToString()
 
-    def _prepare_prepared_statement_query(self, command: "fsql.CommandPreparedStatementQuery"):
+    def _prepare_prepared_statement_query(
+        self, context: fl.ServerCallContext, command: "fsql.CommandPreparedStatementQuery"
+    ):
         """GetFlightInfo for a statement created via ActionCreatePreparedStatement.
 
         The handle carries the SQL *and* the claims captured at prepare time,
@@ -213,6 +232,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
             sql, claims = tickets.decode_prepared_handle(handle)
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired prepared statement: {exc}") from exc
+        _require_ticket_owner(context, claims)
 
         schema = self._execute_for_prepared_handle(handle, sql, claims)
 
@@ -263,20 +283,23 @@ class OpteryxFlightServer(fl.FlightServerBase):
         if parsed and any_msg.Is(fsql.TicketStatementQuery.DESCRIPTOR):
             ticket_stmt = fsql.TicketStatementQuery()
             any_msg.Unpack(ticket_stmt)
-            return self._do_get_statement_query(ticket_stmt.statement_handle)
+            return self._do_get_statement_query(context, ticket_stmt.statement_handle)
 
         if parsed and any_msg.Is(fsql.CommandPreparedStatementQuery.DESCRIPTOR):
             ticket_prepared = fsql.CommandPreparedStatementQuery()
             any_msg.Unpack(ticket_prepared)
-            return self._do_get_prepared_statement_query(ticket_prepared.prepared_statement_handle)
+            return self._do_get_prepared_statement_query(
+                context, ticket_prepared.prepared_statement_handle
+            )
 
-        return self._do_get_metadata(ticket_bytes)
+        return self._do_get_metadata(context, ticket_bytes)
 
-    def _do_get_statement_query(self, handle: bytes) -> fl.FlightDataStream:
+    def _do_get_statement_query(self, context: fl.ServerCallContext, handle: bytes) -> fl.FlightDataStream:
         try:
             sql, claims = tickets.decode_statement_handle(handle)
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired ticket: {exc}") from exc
+        _require_ticket_owner(context, claims)
 
         try:
             entry = query.RESULT_CACHE.get_or_execute(handle, sql, claims)
@@ -290,11 +313,12 @@ class OpteryxFlightServer(fl.FlightServerBase):
 
         return fl.RecordBatchStream(pa.Table.from_batches(entry.batches, schema=entry.schema))
 
-    def _do_get_prepared_statement_query(self, handle: bytes) -> fl.FlightDataStream:
+    def _do_get_prepared_statement_query(self, context: fl.ServerCallContext, handle: bytes) -> fl.FlightDataStream:
         try:
             sql, claims = tickets.decode_prepared_handle(handle)
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired prepared statement: {exc}") from exc
+        _require_ticket_owner(context, claims)
 
         try:
             entry = query.RESULT_CACHE.get_or_execute(handle, sql, claims)
@@ -308,11 +332,12 @@ class OpteryxFlightServer(fl.FlightServerBase):
 
         return fl.RecordBatchStream(pa.Table.from_batches(entry.batches, schema=entry.schema))
 
-    def _do_get_metadata(self, handle: bytes) -> fl.FlightDataStream:
+    def _do_get_metadata(self, context: fl.ServerCallContext, handle: bytes) -> fl.FlightDataStream:
         try:
             command, claims = tickets.decode_metadata_ticket(handle)
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired ticket: {exc}") from exc
+        _require_ticket_owner(context, claims)
 
         entry = query.RESULT_CACHE.pop(handle)
         if entry is not None:

@@ -17,7 +17,6 @@ detour.
 from __future__ import annotations
 
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -28,11 +27,6 @@ from typing import Iterator
 from typing import List
 from typing import Optional
 from typing import Tuple
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../opteryx-core")))
-sys.path.insert(
-    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../opteryx-catalog"))
-)
 
 import opteryx
 import pyarrow as pa

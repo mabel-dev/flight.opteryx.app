@@ -142,13 +142,11 @@ differ.
 flight.opteryx/
   app/
     main.py                  # starts the Flight gRPC server (no ASGI/uvicorn)
-    logging.py                # copied from odata.opteryx, unchanged
-    core.py                   # copied from odata.opteryx, unchanged (Firestore client helper)
-    secret_store.py            # copied from odata.opteryx, unchanged (JWT public key loading)
+    core.py                   # Firestore client helper (from odata.opteryx)
+    secret_store.py            # read-only JWT public key lookup (trimmed from odata.opteryx)
     auth/
       deps.py                  # require_bearer_token logic, adapted to read from Flight
                                 # per-call headers instead of FastAPI Header()
-      external_auth.py          # copied from odata.opteryx, unchanged
       permissions.py            # copied from odata.opteryx, unchanged (policies -> visibility_filters)
     flight/
       server.py                 # the FlightServerBase / Flight SQL subclass — command dispatch
@@ -166,15 +164,18 @@ flight.opteryx/
 
 ### Reused from `odata.opteryx` largely as-is
 
-- `app/logging.py`, `app/core.py`, `app/secret_store.py` — no transport
-  dependency, copy directly.
-- `app/auth/external_auth.py`, `app/auth/permissions.py` — no transport
-  dependency, copy directly.
-- `require_bearer_token` in `app/auth/deps.py` ([odata.opteryx's
-  version](../../odata.opteryx/app/auth/deps.py)) is already synchronous and
+- `app/core.py`, `app/auth/permissions.py` — no transport dependency, copied
+  directly. Logging now comes from `opteryx_shared_services.logging`.
+- `app/secret_store.py` — trimmed to the one read-only call this service
+  needs, `load_public_key(kid)`; key creation and private-key reads stay in
+  the services that issue tokens.
+- `require_bearer_token` in `app/auth/deps.py` (odata.opteryx's version) is
+  already synchronous and
   takes a raw `Authorization` header value — it does not need FastAPI at
-  all. Only its call site changes (Flight middleware instead of a FastAPI
-  `Depends`).
+  all. Its call site changes (Flight middleware instead of a FastAPI
+  `Depends`), and it is hardened here: asymmetric algorithms only, no
+  Google OIDC (Cloud Tasks) fallback, and bounded pre-verification work
+  (dated-`kid` window, cached JWKS).
 - The `opteryx.set_default_connector(OpteryxConnector, catalog=OpteryxCatalog,
   ...)` wiring in `interface.py` — same setup, same env vars
   (`FIRESTORE_DATABASE`, `GCS_BUCKET`, `GCP_PROJECT_ID`).
@@ -229,6 +230,13 @@ already rejects a missing or malformed value with `AuthError(401, ...)`.
 This was in fact the original shape of this snippet; an earlier draft added
 an anonymous-tolerant wrapper on top of it, which has since been removed
 along with the wrapper.
+
+Tickets and prepared statement handles carry the claims they were minted
+under, and are only honoured for that same identity: `DoGet` (and
+`GetFlightInfo` on a prepared handle) checks the caller's identity against
+the one in the handle, so a leaked handle is not usable by another
+authenticated caller. A handle also expires no later than the token it was
+minted under (`exp`), whatever its own TTL.
 
 Unlike the OData service, there is no Basic-auth fallback in v1 — Flight SQL
 JDBC/ODBC drivers authenticate via bearer token or Flight's handshake

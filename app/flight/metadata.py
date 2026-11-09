@@ -12,8 +12,9 @@ rows a caller may see is NOT decided here: every row is put to
 they're left out here.
 
 Table/schema Arrow shapes below are the ones the Flight SQL spec mandates
-per command (see the `FlightSql.proto` comments vendored at
-`app/flight/proto/FlightSql.proto`) -- these are not ours to change.
+per command (see the comments in Apache Arrow's upstream
+`format/FlightSql.proto`, from which `app/flight/proto/FlightSql_pb2.py` is
+generated) -- these are not ours to change.
 """
 
 from __future__ import annotations
@@ -295,7 +296,7 @@ def get_table_types() -> pa.Table:
 # --- CommandGetSqlInfo -------------------------------------------------------
 #
 # Union arm order/type-codes fixed by the Flight SQL spec's documented
-# schema for CommandGetSqlInfo (see app/flight/proto/FlightSql.proto):
+# schema for CommandGetSqlInfo (see the upstream FlightSql.proto):
 # string_value(0), bool_value(1), bigint_value(2), int32_bitmask(3),
 # string_list(4), int32_to_int32_list_map(5). Only the arms actually used
 # below are populated; unused arms are still declared (empty) so the union

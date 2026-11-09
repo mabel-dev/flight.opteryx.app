@@ -1,8 +1,8 @@
 """Transport-agnostic auth error.
 
-`app.auth.deps` and `app.auth.external_auth` are ported from odata.opteryx,
+`app.auth.deps` is ported from odata.opteryx,
 where auth failures are raised as FastAPI `HTTPException`s. Flight has no
-HTTP status codes, so those call sites raise `AuthError` instead; the Flight
+HTTP status codes, so it raises `AuthError` instead; the Flight
 transport layer (`app.flight.auth_middleware`) is the single place that maps
 `AuthError.status_code` onto the matching `pyarrow.flight` error class.
 """
