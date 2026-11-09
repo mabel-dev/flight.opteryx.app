@@ -227,8 +227,11 @@ def require_bearer_token(authorization: Optional[str]) -> Dict[str, Any]:
     if not key:
         key = _get_jwks(auth_url, kid)
     if not key:
-        logger.warning("No verification key available (secret store and JWKS both unavailable)")
-        raise AuthError(503, "Token verification unavailable")
+        # A token we hold no key for is indistinguishable from a forged one, so
+        # it is refused as unauthenticated. Not 503: that would let any made-up
+        # `kid` provoke a "server error" a driver retries instead of re-prompting.
+        logger.warning(f"No verification key for kid={kid!r} (secret store and JWKS)")
+        raise AuthError(401, "Invalid token")
 
     options = {"require_exp": True, "require_iss": True, "verify_nbf": True, "verify_iat": True}
     try:

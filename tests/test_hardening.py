@@ -90,6 +90,13 @@ def test_todays_kid_is_looked_up(_no_network):
     assert _no_network["secret_store"] == 1
 
 
+def test_token_with_no_known_key_is_unauthenticated_not_a_server_error(_no_network):
+    token = _unsigned({"alg": "RS256", "kid": "made-up"}, _claims())
+    with pytest.raises(AuthError) as exc:
+        deps.require_bearer_token(f"Bearer {token}")
+    assert exc.value.status_code == 401
+
+
 def test_jwks_failures_are_not_refetched_on_every_call(_no_network):
     token = _unsigned({"alg": "RS256", "kid": "made-up"}, _claims())
     for _ in range(20):
