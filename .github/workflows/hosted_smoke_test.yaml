@@ -39,11 +39,11 @@ jobs:
 
     - name: mint test-account token
       env:
-        CLIENT_ID: ${{ secrets.FLIGHT_TEST_CLIENT_ID }}
-        CLIENT_SECRET: ${{ secrets.FLIGHT_TEST_CLIENT_SECRET }}
+        CLIENT_ID: ${{ secrets.OPTERYX_TEST_CLIENT }}
+        CLIENT_SECRET: ${{ secrets.OPTERYX_TEST_TOKEN }}
       run: |
         if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
-          echo "::error::FLIGHT_TEST_CLIENT_ID / FLIGHT_TEST_CLIENT_SECRET repository secrets are not set"
+          echo "::error::OPTERYX_TEST_CLIENT / OPTERYX_TEST_TOKEN repository secrets are not set"
           exit 1
         fi
         response=$(curl -sS --fail-with-body --max-time 30 -X POST "$AUTH_TOKEN_URL" \

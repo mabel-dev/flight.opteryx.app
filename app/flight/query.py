@@ -133,6 +133,7 @@ def session_for_claims(claims: Dict[str, Any]) -> "opteryx.query_session.Session
     identity = claims.get("identity")
     access_policies = access_policies_for_query(claims)
     billing_account = claims.get("billing_account")
+    _refuse_if_billing_blocked(billing_account)
     return opteryx.session(
         user=identity,
         access_policies=access_policies,
@@ -143,6 +144,28 @@ def session_for_claims(claims: Dict[str, Any]) -> "opteryx.query_session.Session
         entitlements=sorted(entitlements_from_claims(claims)),
         billing_account=billing_account,
     )
+
+
+def _refuse_if_billing_blocked(billing_account: Optional[str]) -> None:
+    """Raise when the caller's billing account is suspended or at its spending cap.
+
+    Raised as opteryx's `PermissionsError` so every existing handler maps it to
+    `FlightUnauthorizedError` with the message intact - Flight has no 402.
+    """
+    import opteryx.exceptions as opteryx_exceptions
+    from opteryx_shared_services.config import get_config
+
+    from app.auth import billing_block
+    from app.core import _get_firestore_client
+
+    reason = billing_block.check(
+        billing_account,
+        lambda: _get_firestore_client(
+            database=get_config("ACCOUNTS_FIRESTORE_DATABASE", "(default)")
+        ),
+    )
+    if reason:
+        raise opteryx_exceptions.PermissionsError(billing_block.MESSAGES[reason])
 
 
 def _execute_to_tables(
