@@ -1,0 +1,86 @@
+name: Hosted Smoke Test
+
+# Authenticated end-to-end check of the deployed service: mints a token for
+# the test account and runs examples/smoke_test.py against flight.opteryx.app.
+# This service deploys by cloudbuild from a laptop, so there is no deploy event
+# to hang this on -- run it by hand after a deploy, and daily as a canary.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 7 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-smoke-test
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: smoke test (flight.opteryx.app)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FLIGHT_SERVER_URL: grpc+tls://flight.opteryx.app:443
+      AUTH_TOKEN_URL: https://authenticate.opteryx.app/token
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+        cache: pip
+
+    - name: deps
+      run: |
+        python -m pip install -U pip
+        python -m pip install -e .
+
+    - name: mint test-account token
+      env:
+        CLIENT_ID: ${{ secrets.FLIGHT_TEST_CLIENT_ID }}
+        CLIENT_SECRET: ${{ secrets.FLIGHT_TEST_CLIENT_SECRET }}
+      run: |
+        if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+          echo "::error::FLIGHT_TEST_CLIENT_ID / FLIGHT_TEST_CLIENT_SECRET repository secrets are not set"
+          exit 1
+        fi
+        response=$(curl -sS --fail-with-body --max-time 30 -X POST "$AUTH_TOKEN_URL" \
+          --data-urlencode grant_type=client_credentials \
+          --data-urlencode "client_id=$CLIENT_ID" \
+          --data-urlencode "client_secret=$CLIENT_SECRET") || {
+          echo "::error::token request failed"
+          exit 1
+        }
+        token=$(printf '%s' "$response" | python -c "import sys, json; print(json.load(sys.stdin).get('access_token', ''))")
+        if [ -z "$token" ]; then
+          echo "::error::auth response had no access_token"
+          exit 1
+        fi
+        echo "::add-mask::$token"
+        echo "FLIGHT_TOKEN=$token" >> "$GITHUB_ENV"
+
+    # FLIGHT_TOKEN_OTHER is optional: set FLIGHT_TEST_OTHER_CLIENT_ID/SECRET to a
+    # second test identity to also check tickets cannot cross between callers.
+    - name: mint second identity token (optional)
+      env:
+        CLIENT_ID: ${{ secrets.FLIGHT_TEST_OTHER_CLIENT_ID }}
+        CLIENT_SECRET: ${{ secrets.FLIGHT_TEST_OTHER_CLIENT_SECRET }}
+      run: |
+        if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+          echo "second identity not configured; caller-binding checks will be skipped"
+          exit 0
+        fi
+        token=$(curl -sS --fail --max-time 30 -X POST "$AUTH_TOKEN_URL" \
+          --data-urlencode grant_type=client_credentials \
+          --data-urlencode "client_id=$CLIENT_ID" \
+          --data-urlencode "client_secret=$CLIENT_SECRET" \
+          | python -c "import sys, json; print(json.load(sys.stdin).get('access_token', ''))")
+        if [ -n "$token" ]; then
+          echo "::add-mask::$token"
+          echo "FLIGHT_TOKEN_OTHER=$token" >> "$GITHUB_ENV"
+        fi
+
+    - name: smoke test
+      run: python examples/smoke_test.py
