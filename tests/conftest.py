@@ -19,6 +19,21 @@ TEST_CLAIMS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _no_real_firestore(monkeypatch):
+    """No billing read or write reaches a real Firestore unless a test installs a fake.
+
+    `app.core._get_firestore_client` builds a real client from local
+    credentials, and the query path both reads account documents and WRITES
+    usage counters (app.auth.usage_allowance) - against production, from a
+    developer's machine. Returning None makes every billing read fail open, as
+    it does when Firestore is down; tests that need Firestore patch it again.
+    (`app.flight.metadata` binds its own reference at import and is not
+    affected.)
+    """
+    monkeypatch.setattr("app.core._get_firestore_client", lambda *a, **k: None)
+
+
 @pytest.fixture()
 def flight_server(monkeypatch):
     def _fake_require_bearer_token(authorization):

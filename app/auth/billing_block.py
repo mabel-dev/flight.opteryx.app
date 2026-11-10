@@ -76,19 +76,28 @@ def check(account_id: Optional[str], client_factory: Callable) -> Optional[str]:
     """
     if not account_id or account_id == HOUSE_ACCOUNT_ID:
         return None
+    try:
+        account = cached_account(account_id, client_factory)
+    except Exception as exc:  # noqa: BLE001 - fail open, see the module docstring
+        logger.warning(f"billing block check for {account_id} failed, allowing: {exc}")
+        return None
+    return billing_block_reason(account_id, account)
+
+
+def cached_account(account_id: str, client_factory: Callable) -> Optional[dict]:
+    """The `billing_accounts/{account_id}` document, or None if absent; cached for a minute.
+
+    Shared with `usage_allowance`, so the two submit-time checks cost one read.
+    Raises if the read fails - callers decide how to fail.
+    """
     now = time.monotonic()
     hit = _cache.get(account_id)
     if hit is not None and now - hit[0] < CACHE_TTL_SECONDS:
-        account = hit[1]
-    else:
-        try:
-            db = client_factory()
-            snap = db.collection("billing_accounts").document(account_id).get()
-            account = snap.to_dict() if snap.exists else None
-        except Exception as exc:  # noqa: BLE001 - fail open, see the module docstring
-            logger.warning(f"billing block check for {account_id} failed, allowing: {exc}")
-            return None
-        if len(_cache) >= _CACHE_MAX:
-            _cache.clear()
-        _cache[account_id] = (now, account)
-    return billing_block_reason(account_id, account)
+        return hit[1]
+    db = client_factory()
+    snap = db.collection("billing_accounts").document(account_id).get()
+    account = snap.to_dict() if snap.exists else None
+    if len(_cache) >= _CACHE_MAX:
+        _cache.clear()
+    _cache[account_id] = (now, account)
+    return account
