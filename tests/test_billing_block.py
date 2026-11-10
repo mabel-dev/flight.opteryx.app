@@ -1,6 +1,6 @@
 """Queries billed to a suspended or capped account are refused before a session opens.
 
-The rule is vendored from control.opteryx (`app/auth/billing_block.py`). Flight
+The rule is control.opteryx's, shared as `opteryx_shared_services.billing.block`. Flight
 has no 402, so the refusal is opteryx's `PermissionsError`, which the server
 maps to `FlightUnauthorizedError` with the message intact.
 """
@@ -10,7 +10,8 @@ import datetime
 import opteryx.exceptions as opteryx_exceptions
 import pytest
 
-from app.auth import billing_block
+from opteryx_shared_services.billing import accounts as billing_accounts
+from opteryx_shared_services.billing import block as billing_block
 from app.flight import query
 
 NOV = datetime.datetime(2026, 11, 9, 12, tzinfo=datetime.timezone.utc)
@@ -54,7 +55,7 @@ class _Db:
 
 @pytest.fixture
 def accounts(monkeypatch):
-    billing_block._cache.clear()
+    billing_accounts.clear_cache()
     data = {}
     sessions = []
     monkeypatch.setattr("app.core._get_firestore_client", lambda *a, **k: _Db(data))
@@ -62,7 +63,7 @@ def accounts(monkeypatch):
     monkeypatch.setattr(query.opteryx, "session", lambda **kw: sessions.append(kw) or object())
     data["_sessions"] = sessions
     yield data
-    billing_block._cache.clear()
+    billing_accounts.clear_cache()
 
 
 def test_a_suspended_account_gets_no_session(accounts):

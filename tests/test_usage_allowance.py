@@ -1,6 +1,6 @@
 """The free tier's daily allowance, enforced on Flight SQL queries.
 
-The rule is vendored from jobs.opteryx (`app/auth/usage_allowance.py`); jobs and
+The rule is `opteryx_shared_services.billing.allowance`; jobs and
 Flight count onto the same `billing_accounts/{account}/usage/{YYYYMMDD}`
 counters. Flight has no 402, so a refusal is opteryx's `PermissionsError`,
 which the server maps to `FlightUnauthorizedError` with the message intact.
@@ -14,7 +14,8 @@ import pyarrow.flight as fl
 import pytest
 from google.cloud.firestore_v1.transforms import Increment
 
-from app.auth import billing_block, usage_allowance as ua
+from opteryx_shared_services.billing import accounts
+from opteryx_shared_services.billing import allowance as ua
 from app.flight import query
 from tests.helpers import statement_query_descriptor
 
@@ -24,7 +25,7 @@ GB = ua.BYTES_PER_GIGABYTE
 INDIVIDUAL = ua.STANDARD_CARDS[ua.STANDARD_INDIVIDUAL]
 
 
-# --- the vendored rule: same cases jobs pins ---------------------------------
+# --- the shared rule, as Flight calls it -----------------------------------
 
 
 @pytest.mark.parametrize(
@@ -116,8 +117,8 @@ class _Session:
 
 @pytest.fixture
 def env(monkeypatch):
-    billing_block._cache.clear()
-    ua._card_cache.clear()
+    accounts.clear_cache()
+    ua.clear_cache()
     fs = _Firestore()
     config = {}
     session = _Session(billing_bytes=40_000_000)
@@ -125,8 +126,8 @@ def env(monkeypatch):
     monkeypatch.setattr(query, "get_config", lambda key, default=None: config.get(key, default))
     monkeypatch.setattr(query, "session_for_claims", lambda claims: session)
     yield fs, config, session
-    billing_block._cache.clear()
-    ua._card_cache.clear()
+    accounts.clear_cache()
+    ua.clear_cache()
 
 
 CLAIMS = {"identity": "alice", "billing_account": "alice"}
@@ -232,11 +233,11 @@ def test_the_refusal_reaches_a_flight_client_as_unauthorized(flight_server, auth
     _, client = flight_server
     fs = _Firestore()
     fs.set_usage("test-account", queries=100)
-    billing_block._cache.clear()
-    ua._card_cache.clear()
+    accounts.clear_cache()
+    ua.clear_cache()
     monkeypatch.setattr("app.core._get_firestore_client", lambda *a, **k: fs)
 
     with pytest.raises(fl.FlightUnauthorizedError, match="Daily query allowance used"):
         client.get_flight_info(statement_query_descriptor("SELECT name FROM $planets"), auth_options)
 
-    billing_block._cache.clear()
+    accounts.clear_cache()

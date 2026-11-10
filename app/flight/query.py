@@ -157,7 +157,7 @@ def _refuse_if_billing_blocked(billing_account: Optional[str]) -> None:
     import opteryx.exceptions as opteryx_exceptions
     from opteryx_shared_services.config import get_config
 
-    from app.auth import billing_block
+    from opteryx_shared_services.billing import block as billing_block
     from app.core import _get_firestore_client
 
     reason = billing_block.check(
@@ -177,7 +177,7 @@ def _accounts_db():
 
 
 def _check_daily_allowance(billing_account: Optional[str]) -> Optional[str]:
-    """Refuse a free-tier payer that has used today's allowance (app.auth.usage_allowance).
+    """Refuse a free-tier payer that has used today's allowance (opteryx_shared_services.billing.allowance).
 
     Same rule, counters and wording as jobs' `_enforce_daily_allowance`: the two
     front doors spend one allowance. Raised as `PermissionsError`, like the
@@ -190,7 +190,8 @@ def _check_daily_allowance(billing_account: Optional[str]) -> Optional[str]:
     """
     import opteryx.exceptions as opteryx_exceptions
 
-    from app.auth import billing_block, usage_allowance
+    from opteryx_shared_services.billing import accounts
+    from opteryx_shared_services.billing import allowance as usage_allowance
 
     mode = usage_allowance.normalise_mode(get_config("BILLING_ALLOWANCE_MODE", "enforce"))
     if mode == usage_allowance.MODE_OFF or not billing_account:
@@ -201,7 +202,7 @@ def _check_daily_allowance(billing_account: Optional[str]) -> Optional[str]:
     now = datetime.now(timezone.utc)
     day = usage_allowance.usage_day(now)
     try:
-        account = billing_block.cached_account(billing_account, _accounts_db)
+        account = accounts.cached_account(billing_account, _accounts_db)
         plan = usage_allowance.effective_plan(billing_account, account)
         if plan != usage_allowance.PLAN_FREE:
             return None
@@ -264,7 +265,7 @@ def _execute_to_tables(
     billing_account = claims.get("billing_account")
     usage_day = _check_daily_allowance(billing_account)
     if usage_day:
-        from app.auth import usage_allowance
+        from opteryx_shared_services.billing import allowance as usage_allowance
 
         _meter("count query", billing_account, usage_day, usage_allowance.count_admission)
 
@@ -281,7 +282,7 @@ def _execute_to_tables(
         except Exception:  # noqa: BLE001 - telemetry is diagnostic; never fail a finished query
             nbytes = 0
         if nbytes > 0:
-            from app.auth import usage_allowance
+            from opteryx_shared_services.billing import allowance as usage_allowance
 
             _meter(
                 "settle bytes",
