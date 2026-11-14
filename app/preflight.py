@@ -22,8 +22,8 @@ preflight = Preflight(
     checks=(
         secret_manager(),
         # `personal` is the workspace collection a Flight client resolves
-        # against; the configuration document shares the `(default)` database.
-        firestore_read("firestore-personal", collection="personal"),
+        # against; workspaces live in the catalog database.
+        firestore_read("firestore-personal", collection="personal", database_key="FIRESTORE_DATABASE"),
         firestore_read(
             "firestore-catalog",
             collection="$catalog",
