@@ -34,6 +34,39 @@ def _no_real_firestore(monkeypatch):
     monkeypatch.setattr("app.core._get_firestore_client", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _platform_operational(monkeypatch):
+    """The platform maintenance switch reads no real Firestore: it is `operational`.
+
+    Every query and metadata RPC checks `opteryx_shared_services.platform_mode`,
+    whose default reader would otherwise go to the real config document. A
+    reader over a document with no `platform_mode` field is the switch turned
+    off. tests/test_platform_mode.py installs its own to change the mode.
+    """
+    from opteryx_shared_services import platform_mode
+
+    class _NoSwitch:
+        exists = False
+
+        def collection(self, name):
+            return self
+
+        def document(self, environment):
+            return self
+
+        def get(self, timeout=None):
+            return self
+
+    monkeypatch.delenv(platform_mode.ENV_OVERRIDE, raising=False)
+    monkeypatch.setattr(
+        platform_mode,
+        "_default",
+        platform_mode.PlatformMode(
+            environment="test", client_provider=_NoSwitch, promoted=lambda k, v: False
+        ),
+    )
+
+
 @pytest.fixture()
 def flight_server(monkeypatch):
     def _fake_require_bearer_token(authorization):

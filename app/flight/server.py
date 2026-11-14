@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import opteryx
 import opteryx.exceptions as opteryx_exceptions
 import pyarrow as pa
 import pyarrow.flight as fl
@@ -46,6 +47,7 @@ from app.flight import tickets
 from app.flight.auth_middleware import ClaimsMiddlewareFactory
 from app.flight.auth_middleware import claims_from_context
 from app.flight.proto import FlightSql_pb2 as fsql
+from opteryx_shared_services import platform_mode
 from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
@@ -158,6 +160,50 @@ def _require_ticket_owner(context: fl.ServerCallContext, ticket_claims: dict) ->
         raise fl.FlightUnauthorizedError("Ticket was issued to a different caller")
 
 
+def _statement_operation(sql: str) -> str:
+    """READ or WRITE, for the platform switch.
+
+    Flight is not as read-only as its advert: the default connector is
+    opteryx-core's `OpteryxConnector`, which is `Writable` (insert, drop_relation,
+    create_view, ...), so an INSERT or DDL statement sent as a
+    CommandStatementQuery is executed by opteryx and refused, if at all, by the
+    caller's access policies. Same rule as worker.opteryx's `app/fleet/kinds.py`:
+    READ only when the engine says it reads and neither mutates nor changes the
+    catalog; anything else, including what it cannot parse, is WRITE.
+    """
+    try:
+        info = opteryx.analyze_query(sql)
+    except Exception:  # noqa: BLE001 - unclassifiable is treated as a write, never let through
+        return platform_mode.WRITE
+    if info.get("is_read") is True and not info.get("is_mutation") and not info.get("is_ddl"):
+        return platform_mode.READ
+    return platform_mode.WRITE
+
+
+def _refuse_if_platform_paused(sql: Optional[str] = None) -> None:
+    """Refuse the call when the platform maintenance switch says so.
+
+    Read on every call, at the point of acting, never cached here
+    (`platform_mode` caches for its own few seconds). The mode is read ONCE and
+    that one snapshot decides both whether to classify and whether to refuse:
+    reading it twice would let a write classified under `operational` through
+    under a `read_only` read a moment later. While operational everything is
+    allowed, so the parse is skipped and the normal path pays nothing for it.
+
+    `sql=None` is a catalog or metadata read. Flight answers synchronously, so
+    `queue` refuses exactly like `reject`.
+    """
+    state = platform_mode.current()
+    if state.mode == platform_mode.OPERATIONAL:
+        return
+    operation = platform_mode.READ if sql is None else _statement_operation(sql)
+    refusal = platform_mode.refusal_for(state, platform_mode.FLIGHT, operation)
+    if refusal is not None:
+        raise fl.FlightUnavailableError(
+            f"{refusal.message} Retry after {refusal.retry_after_seconds}s."
+        )
+
+
 class OpteryxFlightServer(fl.FlightServerBase):
     def __init__(self, location: Optional[str] = None, **kwargs):
         middleware = kwargs.pop("middleware", {})
@@ -194,6 +240,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
 
     def _prepare_statement_query(self, command: "fsql.CommandStatementQuery", claims: dict):
         sql = command.query
+        _refuse_if_platform_paused(sql)
         handle = tickets.encode_statement_handle(sql, claims)
         try:
             schema = query.RESULT_CACHE.execute_and_cache(handle, sql, claims)
@@ -233,6 +280,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired prepared statement: {exc}") from exc
         _require_ticket_owner(context, claims)
+        _refuse_if_platform_paused(sql)
 
         schema = self._execute_for_prepared_handle(handle, sql, claims)
 
@@ -257,6 +305,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
             raise _map_opteryx_exception(exc) from exc
 
     def _prepare_metadata_command(self, command, claims: dict):
+        _refuse_if_platform_paused()
         table = _execute_metadata_command(command, claims)
         handle = tickets.encode_metadata_ticket(command, claims)
         query.RESULT_CACHE.put_table(handle, table)
@@ -300,6 +349,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired ticket: {exc}") from exc
         _require_ticket_owner(context, claims)
+        _refuse_if_platform_paused(sql)
 
         try:
             entry = query.RESULT_CACHE.get_or_execute(handle, sql, claims)
@@ -319,6 +369,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired prepared statement: {exc}") from exc
         _require_ticket_owner(context, claims)
+        _refuse_if_platform_paused(sql)
 
         try:
             entry = query.RESULT_CACHE.get_or_execute(handle, sql, claims)
@@ -338,6 +389,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
         except tickets.InvalidTicket as exc:
             raise fl.FlightServerError(f"Invalid or expired ticket: {exc}") from exc
         _require_ticket_owner(context, claims)
+        _refuse_if_platform_paused()
 
         entry = query.RESULT_CACHE.pop(handle)
         if entry is not None:
@@ -377,6 +429,7 @@ class OpteryxFlightServer(fl.FlightServerBase):
         claims = claims_from_context(context)
         request = _unpack_action_body(action, fsql.ActionCreatePreparedStatementRequest)
         sql = request.query
+        _refuse_if_platform_paused(sql)
 
         # The handle must be minted before execution, because it doubles as the
         # result cache key -- executing under it here means the GetFlightInfo
