@@ -35,6 +35,7 @@ from opteryx_access import can_perform_action
 
 from app.auth.permissions import grants_from_claims
 from app.core import _get_firestore_client
+from opteryx_shared_services.config import get_config
 from opteryx_shared_services.logging import get_logger
 
 logger = get_logger()
@@ -160,7 +161,7 @@ def list_visible_datasets(claims: Dict[str, Any]) -> List[DatasetRow]:
     somebody's grants -- so it is left with whatever the library grants
     everyone.
     """
-    db = _get_firestore_client(database="catalogs")
+    db = _get_firestore_client(database=get_config("FIRESTORE_DATABASE", "catalogs"))
     if db is None:
         logger.error("Firestore client unavailable; returning no catalog metadata")
         return []

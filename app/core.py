@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Optional
 
 from google.cloud import firestore
+from opteryx_shared_services.config import get_config
 
 
 @lru_cache(maxsize=1)
@@ -17,8 +18,7 @@ def _get_firestore_client(
 
     If ``project`` is not provided the function will attempt to infer it from
     environment variables (GCP_PROJECT, GCP_PROJECT_ID, GOOGLE_CLOUD_PROJECT).
-    An optional ``database`` parameter is forwarded to ``firestore.Client`` to
-    support non-default Firestore databases within the same project.
+    ``database`` defaults to the accounts database, ``CLIENTS_FIRESTORE_DATABASE``.
     On any exception, None is returned so higher-level code can fall back
     to treating Firestore as a dependent service that is unavailable.
     """
@@ -28,11 +28,9 @@ def _get_firestore_client(
             or os.environ.get("GCP_PROJECT_ID")
             or os.environ.get("GOOGLE_CLOUD_PROJECT")
         )
-        client_kwargs = {}
+        client_kwargs = {"database": database or get_config("CLIENTS_FIRESTORE_DATABASE", "(default)")}
         if proj:
             client_kwargs["project"] = proj
-        if database is not None:
-            client_kwargs["database"] = database
-        return firestore.Client(**client_kwargs) if client_kwargs else firestore.Client()
+        return firestore.Client(**client_kwargs)
     except Exception:
         return None

@@ -163,7 +163,7 @@ def _refuse_if_billing_blocked(billing_account: Optional[str]) -> None:
     reason = billing_block.check(
         billing_account,
         lambda: _get_firestore_client(
-            database=get_config("ACCOUNTS_FIRESTORE_DATABASE", "(default)")
+            database=get_config("CLIENTS_FIRESTORE_DATABASE", "(default)")
         ),
     )
     if reason:
@@ -173,7 +173,7 @@ def _refuse_if_billing_blocked(billing_account: Optional[str]) -> None:
 def _accounts_db():
     from app.core import _get_firestore_client
 
-    return _get_firestore_client(database=get_config("ACCOUNTS_FIRESTORE_DATABASE", "(default)"))
+    return _get_firestore_client(database=get_config("CLIENTS_FIRESTORE_DATABASE", "(default)"))
 
 
 def _check_daily_allowance(billing_account: Optional[str]) -> Optional[str]:
