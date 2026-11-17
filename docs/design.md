@@ -338,11 +338,15 @@ info codes it doesn't yet answer.
   in-flight streams during scale-from-zero — worth measuring rather than
   assuming.
 
-### `cloudbuild/cloudbuild.yaml`
+### Deploy pipeline
 
-Same shape as `odata.opteryx`'s (build → push, tagged
-`us-east1-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/flight-opteryx:$SHORT_SHA`),
-swap only the image name.
+`.github/workflows/deploy.yaml`, the same shape as `odata.opteryx`'s: tests →
+build + push → no-traffic `canary` revision → smoke test
+(`hosted_smoke_test.yaml`, against the canary's URL) → promote. It replaced
+the GCP-side `flight-opteryx` Cloud Build trigger, which had no token for the
+private `opteryx-wheels` index `opteryx-core` is installed from.
+`cloudbuild/cloudbuild.yaml` (passes that token as a BuildKit secret) is kept
+for manual builds only.
 
 ## Testing approach
 

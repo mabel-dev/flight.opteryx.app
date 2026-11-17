@@ -34,6 +34,24 @@ dev = [
     "pytest>=8",
 ]
 
+# opteryx-core comes from Artifact Registry (`opteryx-wheels`), never PyPI. opteryx-core's
+# `gar-*` tags publish there only (cp314, x86_64 + aarch64 - what production runs); PyPI releases
+# are rarer and have gaps, so a version the SaaS needs may never be on PyPI. `explicit`: this
+# index serves opteryx-core and nothing else, and opteryx-core is never looked for on PyPI.
+#
+# The index needs credentials: uv reads them from UV_INDEX_OPTERYX_WHEELS_USERNAME
+# (`oauth2accesstoken`) and UV_INDEX_OPTERYX_WHEELS_PASSWORD (`gcloud auth print-access-token`).
+# Install with uv: pip ignores [tool.uv.*] and would look for the pin on PyPI. There are no
+# macOS wheels in this channel.
+[[tool.uv.index]]
+name = "opteryx-wheels"
+url = "https://us-east1-python.pkg.dev/mabeldev/opteryx-wheels/simple/"
+explicit = true
+authenticate = "always"
+
+[tool.uv.sources]
+opteryx-core = { index = "opteryx-wheels" }
+
 [tool.isort]
 profile = "black"
 extend_skip_glob = ["tests/**"]

@@ -33,12 +33,20 @@ COPY --from=mimalloc /mi/libmimalloc.so.3.3 /usr/local/lib/libmimalloc.so.3
 # Copy project pyproject from the build context (repository root) and install with uv.
 # NOTE: Run this from the repository root so `pyproject.toml` is available in the
 # build context. Example:
-#   docker build -f Dockerfile -t opteryx-flight .
+#   GAR_TOKEN="$(gcloud auth print-access-token)" \
+#     docker build --secret id=gar_token,env=GAR_TOKEN -f Dockerfile -t opteryx-flight .
 COPY pyproject.toml ./pyproject.toml
 # Install uv, then install project dependencies into .venv. `--no-install-project`
 # installs only the dependencies; the service code is imported directly by the
 # entrypoint from ./app (copied below), not installed as a package.
-RUN pip install --no-cache-dir uv && \
+# opteryx-core comes from Artifact Registry ([tool.uv.sources] in pyproject.toml), which needs a
+# token: pass one as a BuildKit secret, so it is never in a layer or the image's history -
+#   GAR_TOKEN="$(gcloud auth print-access-token)" docker build --secret id=gar_token,env=GAR_TOKEN .
+# Without it the install fails with a 401; it never falls back to PyPI.
+RUN --mount=type=secret,id=gar_token,required=true \
+    pip install --no-cache-dir uv && \
+    UV_INDEX_OPTERYX_WHEELS_USERNAME=oauth2accesstoken \
+    UV_INDEX_OPTERYX_WHEELS_PASSWORD="$(cat /run/secrets/gar_token)" \
     uv sync --no-install-project || \
     (echo "uv sync failed; ensure pyproject.toml is present and valid in the build context" && exit 1)
 

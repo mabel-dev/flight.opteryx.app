@@ -1,0 +1,213 @@
+name: Deploy
+
+# Every change to main is deployed by this workflow, and only by it (it replaces the
+# `flight-opteryx` Cloud Build trigger, whose build steps lived in GCP rather than here and
+# had no token for Artifact Registry, so it cannot install opteryx-core):
+#
+#   tests ─► build + push (x86_64) ─► canary revision ─► smoke test the canary ─► promote
+#
+# 1. tests     The unit suite (tests.yaml).
+# 2. build     The image, on x86_64 because that is what Cloud Run runs, so it installs the
+#              x86_64 cp314 opteryx-core wheel from Artifact Registry.
+# 3. canary    The image is deployed as a new revision that takes NO traffic, tagged `canary`,
+#              which gives it its own URL. Its startup gate (`app.preflight`, Dockerfile CMD)
+#              must pass for it to become ready at all.
+# 4. smoke     hosted_smoke_test.yaml runs examples/smoke_test.py against the canary's URL
+#              with a real test-account token: a statement query, the metadata commands and
+#              the prepared-statement round trip, over gRPC as a JDBC/ODBC client would.
+# 5. promote   Only now does traffic move - all of it, to that exact revision, never a rebuild.
+#              The run summary records the revision that was serving and the command that
+#              puts traffic back on it.
+#
+# A failed canary leaves traffic where it was; the failed revision keeps the `canary` tag
+# for inspection until the next deploy reassigns it.
+#
+# Traffic is pinned to a named revision, not to LATEST: a revision created outside this
+# workflow (a console edit, a `gcloud run services update`) takes no traffic until it is
+# promoted, so nothing reaches users without passing the canary.
+
+on:
+  push:
+    branches: [main]
+  # Re-run a deploy without a commit (e.g. after fixing the deploy identity's access).
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# One deploy at a time, never cancelled part-way. A newer push waits; if several queue,
+# only the newest runs.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: mabeldev
+  REGION: us-east1
+  IMAGE: us-east1-docker.pkg.dev/mabeldev/cloud-run-source-deploy/flight.opteryx.app/flight-opteryx-app-git
+  CLOUD_RUN_SERVICE: flight-opteryx-app-git
+  WORKLOAD_IDENTITY_PROVIDER: projects/762690895289/locations/global/workloadIdentityPools/github/providers/github
+  DEPLOY_SERVICE_ACCOUNT: gh-deploy@mabeldev.iam.gserviceaccount.com
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yaml
+
+  canary:
+    name: Build, deploy canary
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      revision: ${{ steps.canary.outputs.revision }}
+      url: ${{ steps.canary.outputs.url }}
+      flight_url: ${{ steps.canary.outputs.flight_url }}
+      previous: ${{ steps.previous.outputs.traffic }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Before the build: opteryx-core is installed from Artifact Registry (pyproject.toml).
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build image
+        # The token goes in as a BuildKit secret: never in a layer or the image's history.
+        env:
+          GAR_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          test "$(uname -m)" = "x86_64"
+          docker build --secret id=gar_token,env=GAR_TOKEN -t "$IMAGE:${GITHUB_SHA}" .
+
+      - name: Docker login to Artifact Registry
+        # Log in with the federated access token explicitly: the gcloud credential helper does
+        # not reliably pick up WIF tokens (same as odata.opteryx and jobs.opteryx).
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Push image
+        id: push
+        # Then resolve the tag to the linux/amd64 image's digest (scripts/image_digest.py):
+        # the push is an index, Cloud Run records the platform image's digest on a revision,
+        # and deploying by that digest is what makes the revision provably this build.
+        env:
+          GAR_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          docker push "$IMAGE:${GITHUB_SHA}"
+          image="$(python3 scripts/image_digest.py "$IMAGE:${GITHUB_SHA}")"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "built: \`$image\`" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Record what the service runs now
+        id: previous
+        run: |
+          serving="$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --region="$REGION" --project="$PROJECT_ID" --format=json \
+            | python3 -c 'import json, sys; t = json.load(sys.stdin)["status"]["traffic"]; print(",".join("%s=%s" % (e["revisionName"], e["percent"]) for e in t if e.get("percent")))')"
+          echo "traffic=$serving" >> "$GITHUB_OUTPUT"
+          {
+            echo "serving before this deploy: \`$serving\`"
+            echo ""
+            echo "roll back with:"
+            echo "\`gcloud run services update-traffic $CLOUD_RUN_SERVICE --region=$REGION --project=$PROJECT_ID --to-revisions=$serving\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy the canary revision (no traffic)
+        # `services update --image` changes only the image; the service's other settings
+        # (--use-http2, timeout, concurrency, scaling, VPC egress, service account, env)
+        # stay as they are. It waits for the revision to become ready, so a failed startup
+        # gate fails this step.
+        run: |
+          gcloud run services update "$CLOUD_RUN_SERVICE" \
+            --image="${{ steps.push.outputs.image }}" \
+            --no-traffic \
+            --tag=canary \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --update-labels="managed-by=github-actions,commit-sha=${GITHUB_SHA}" \
+            --quiet
+
+      - name: Find the canary revision
+        id: canary
+        # The revision the `canary` tag points at, and its URL - checked to be running this
+        # commit's image, so the canary can never pass on some other revision.
+        run: |
+          read -r revision url < <(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --region="$REGION" --project="$PROJECT_ID" --format=json \
+            | python3 -c 'import json, sys; t = [e for e in json.load(sys.stdin)["status"]["traffic"] if e.get("tag") == "canary"]; assert len(t) == 1, t; print(t[0]["revisionName"], t[0]["url"])')
+          if [ -z "$revision" ] || [ -z "$url" ]; then
+            echo "::error::no revision carries the canary tag"
+            exit 1
+          fi
+          image="$(gcloud run revisions describe "$revision" \
+            --region="$REGION" --project="$PROJECT_ID" \
+            --format='value(spec.containers[0].image)')"
+          if [ "$image" != "${{ steps.push.outputs.image }}" ]; then
+            echo "::error::canary tag points at $revision, which runs $image, not ${{ steps.push.outputs.image }}"
+            exit 1
+          fi
+          # Cloud Run's URL is https://<host>; Flight clients take grpc+tls://<host>:443.
+          host="${url#https://}"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "flight_url=grpc+tls://${host%/}:443" >> "$GITHUB_OUTPUT"
+          echo "canary: \`$revision\` at grpc+tls://${host%/}:443" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  smoke:
+    name: Smoke test the canary
+    needs: canary
+    uses: ./.github/workflows/hosted_smoke_test.yaml
+    with:
+      url: ${{ needs.canary.outputs.flight_url }}
+    secrets: inherit
+
+  promote:
+    name: Promote
+    needs: [canary, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Promote
+        run: |
+          gcloud run services update-traffic "$CLOUD_RUN_SERVICE" \
+            --to-revisions="${{ needs.canary.outputs.revision }}=100" \
+            --remove-tags=canary \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --quiet
+          echo "promoted: \`${{ needs.canary.outputs.revision }}\` now takes 100% of traffic" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  canary-failed:
+    name: Canary failed - traffic not moved
+    needs: [canary, smoke]
+    if: failure() && needs.canary.outputs.revision != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report
+        run: |
+          {
+            echo "**Canary failed.** Traffic stayed on \`${{ needs.canary.outputs.previous }}\`."
+            echo ""
+            echo "The failed revision \`${{ needs.canary.outputs.revision }}\` keeps the \`canary\` tag at ${{ needs.canary.outputs.flight_url }} for inspection."
+          } | tee -a "$GITHUB_STEP_SUMMARY"

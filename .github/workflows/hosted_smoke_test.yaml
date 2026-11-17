@@ -1,28 +1,43 @@
 name: Hosted Smoke Test
 
 # Authenticated end-to-end check of the deployed service: mints a token for
-# the test account and runs examples/smoke_test.py against flight.opteryx.app.
-# This service deploys by cloudbuild from a laptop, so there is no deploy event
-# to hang this on -- run it by hand after a deploy, and daily as a canary.
+# the test account and runs examples/smoke_test.py against it. deploy.yaml
+# calls this against the no-traffic canary revision before promoting it; it
+# also runs daily against flight.opteryx.app, and by hand.
 on:
   workflow_dispatch:
   schedule:
     - cron: '23 7 * * *'
+  workflow_call:
+    inputs:
+      url:
+        description: Flight endpoint to test, e.g. grpc+tls://<host>:443
+        type: string
+        required: true
 
+# id-token: the smoke test imports app/ (for the Flight SQL protobufs), whose
+# dependencies include opteryx-core from Artifact Registry.
 permissions:
+  id-token: write
   contents: read
 
+# Standalone runs (no url input) share one group; a deploy's call is keyed on
+# its canary url so it never waits behind the daily run.
 concurrency:
-  group: hosted-smoke-test
+  group: hosted-smoke-test-${{ inputs.url || 'flight.opteryx.app' }}
   cancel-in-progress: false
+
+env:
+  WORKLOAD_IDENTITY_PROVIDER: projects/762690895289/locations/global/workloadIdentityPools/github/providers/github
+  DEPLOY_SERVICE_ACCOUNT: gh-deploy@mabeldev.iam.gserviceaccount.com
 
 jobs:
   smoke:
-    name: smoke test (flight.opteryx.app)
+    name: smoke test (${{ inputs.url || 'flight.opteryx.app' }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      FLIGHT_SERVER_URL: grpc+tls://flight.opteryx.app:443
+      FLIGHT_SERVER_URL: ${{ inputs.url || 'grpc+tls://flight.opteryx.app:443' }}
       AUTH_TOKEN_URL: https://authenticate.opteryx.app/token
     steps:
     - uses: actions/checkout@v4
@@ -30,12 +45,26 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: "3.14"
-        cache: pip
+
+    - name: Authenticate to Google Cloud (opteryx-core is read from Artifact Registry)
+      id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+        token_format: access_token
+        create_credentials_file: false
+        export_environment_variables: false
 
     - name: deps
+      # uv, not pip: pip ignores [tool.uv.sources] and would look for the
+      # opteryx-core pin on PyPI.
+      env:
+        UV_INDEX_OPTERYX_WHEELS_USERNAME: oauth2accesstoken
+        UV_INDEX_OPTERYX_WHEELS_PASSWORD: ${{ steps.auth.outputs.access_token }}
       run: |
-        python -m pip install -U pip
-        python -m pip install -e .
+        python -m pip install -U pip uv
+        python -m uv pip install --system -e .
 
     - name: mint test-account token
       env:

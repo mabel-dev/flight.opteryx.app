@@ -1,19 +1,23 @@
 name: Tests
 
 on:
-  push:
-    branches:
-      - main
+  # Not on push to main: deploy.yaml runs this suite there (as its first job)
+  # and deploys only if it passes; a second run here would test the commit twice.
   pull_request:
-  # Exposed so another workflow can gate on this exact suite rather than
-  # re-declaring its own copy, which would be free to drift from the one that
-  # runs on PRs. Nothing calls it yet -- this service deploys by cloudbuild
-  # from a laptop, so CI here is a merge gate, not a deploy gate.
+  # deploy.yaml gates on this exact suite rather than re-declaring its own
+  # copy, which would be free to drift from the one that runs on PRs.
   workflow_call:
 
-# Tests only need to read the code; nothing here writes back to the repo.
+# id-token: opteryx-core is installed from Artifact Registry, which needs a
+# Google token (pyproject.toml [tool.uv.sources]). A caller (deploy.yaml) must
+# grant the same. Nothing here writes back to the repo.
 permissions:
+  id-token: write
   contents: read
+
+env:
+  WORKLOAD_IDENTITY_PROVIDER: projects/762690895289/locations/global/workloadIdentityPools/github/providers/github
+  DEPLOY_SERVICE_ACCOUNT: gh-deploy@mabeldev.iam.gserviceaccount.com
 
 # A newer push to the same branch makes the in-flight run irrelevant.
 concurrency:
@@ -41,12 +45,28 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
-        cache: pip
+
+    - name: Authenticate to Google Cloud (opteryx-core is read from Artifact Registry)
+      # Token only: no credentials file and no GOOGLE_APPLICATION_CREDENTIALS,
+      # so tests cannot reach production data as the deploy identity.
+      id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+        token_format: access_token
+        create_credentials_file: false
+        export_environment_variables: false
 
     - name: deps
+      # uv, not pip: opteryx-core comes from Artifact Registry through
+      # [tool.uv.sources], which pip ignores - it would look for the pin on PyPI.
+      env:
+        UV_INDEX_OPTERYX_WHEELS_USERNAME: oauth2accesstoken
+        UV_INDEX_OPTERYX_WHEELS_PASSWORD: ${{ steps.auth.outputs.access_token }}
       run: |
-        python -m pip install -U pip
-        python -m pip install -e ".[dev]"
+        python -m pip install -U pip uv
+        python -m uv pip install --system -e ".[dev]"
 
     - name: test
       run: python -m pytest tests/ -v --durations=10

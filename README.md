@@ -65,12 +65,17 @@ docs/design.md               # full design doc
 ## Local development
 
 ```bash
-uv sync
+UV_INDEX_OPTERYX_WHEELS_USERNAME=oauth2accesstoken \
+UV_INDEX_OPTERYX_WHEELS_PASSWORD="$(gcloud auth print-access-token)" \
+  uv sync
 ```
 
-(if `uv` isn't set up for your Python toolchain, a plain `python3 -m venv
-.venv && .venv/bin/pip install -e .` works too — `uv` is just what the
-Dockerfile and `odata.opteryx` both use)
+`opteryx-core` comes from the private `opteryx-wheels` Artifact Registry
+index, never PyPI (`[tool.uv.sources]` in `pyproject.toml`), so the install
+needs a Google access token, and it must be `uv`: pip ignores
+`[tool.uv.*]` and would look for the pin on PyPI. That index carries Linux
+cp314 wheels only, so on macOS install a PyPI release of `opteryx-core` by
+hand if you need one.
 
 Run the tests (unit tests against the command handlers directly, plus an
 in-process `pyarrow.flight.FlightClient` round trip against a real bound
@@ -143,8 +148,18 @@ against a live deployment.
 
 ## Deployment
 
-Cloud Run, same pattern as `odata.opteryx`, with two gRPC-specific
-requirements the design doc calls out:
+Every push to `main` deploys through
+[`.github/workflows/deploy.yaml`](.github/workflows/deploy.yaml), the same
+pipeline as `odata.opteryx`: tests, build (with an Artifact Registry token as
+a BuildKit secret, for `opteryx-core`), a no-traffic `canary` revision,
+[`hosted_smoke_test.yaml`](.github/workflows/hosted_smoke_test.yaml) against
+that revision's own URL, then promote it to 100% of traffic. A failed canary
+leaves traffic where it was. `cloudbuild/cloudbuild.yaml` is kept for manual
+builds only.
+
+The Cloud Run service (`flight-opteryx-app-git`) has two gRPC-specific
+settings the design doc calls out; the deploy changes only the image, so they
+stay as set on the service:
 
 - **`--use-http2`** is required — Cloud Run's ingress needs to know this is a
   gRPC service, or every Flight call fails at the protocol level before it

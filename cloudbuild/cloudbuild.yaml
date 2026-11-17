@@ -1,10 +1,18 @@
+# Manual builds only (`gcloud builds submit --config cloudbuild/cloudbuild.yaml`). Deploys go
+# through .github/workflows/deploy.yaml.
 options:
   env:
     - 'AR_REGION=us-east1'
     - 'AR_REPOSITORY=cloud-run-source-deploy'
 steps:
+  # opteryx-core is installed from the private opteryx-wheels Python repo; hand
+  # the build an access token as a BuildKit secret.
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args: [ '-c', 'gcloud auth print-access-token > /workspace/gar_token' ]
   - name: 'gcr.io/cloud-builders/docker'
-    args: [ 'build', '-t', 'us-east1-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/flight-opteryx:$SHORT_SHA', '.' ]
+    env: [ 'DOCKER_BUILDKIT=1' ]
+    args: [ 'build', '--secret', 'id=gar_token,src=/workspace/gar_token', '-t', 'us-east1-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/flight-opteryx:$SHORT_SHA', '.' ]
   - name: 'gcr.io/cloud-builders/docker'
     args: [ 'push', 'us-east1-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/flight-opteryx:$SHORT_SHA' ]
 images:
